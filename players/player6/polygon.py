@@ -1,6 +1,6 @@
-from shapely.geometry import Polygon, MultiPoint, box
-from shapely.ops import unary_union, polylabel
 from shapely import affinity, constrained_delaunay_triangles
+from shapely.geometry import MultiPoint, Polygon, box
+from shapely.ops import polylabel, unary_union
 
 
 def triangles(poly):
