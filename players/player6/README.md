@@ -64,6 +64,15 @@ at most two distinct exact boundary prefixes before the existing global beam
 selection. This preserves some geometric diversity without increasing the
 global beam width; the per-state cap remains heuristic.
 
+Closed beam candidates must have at least one gate face. After placement, a
+validated baseline is retained before retrying material assignment for two
+distinct gate faces. Gate-constrained queries have separate caches from prefix
+feasibility checks. Each optional retry gets up to 0.01 CPU seconds; all such
+retries share at most 5% of the existing beam budget. A cutoff or impossible
+bonus keeps the original plan. The current Player6 score is also passed to
+beam search, so closed candidates whose optimistic score cannot improve it
+are skipped before placement.
+
 The percentages are starting values, not a measured optimum across all rooms.
 Increasing time cannot improve a stage whose candidate set is exhausted.
 A single native geometry call may exceed a cooperative deadline until it returns;

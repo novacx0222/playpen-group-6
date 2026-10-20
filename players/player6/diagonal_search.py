@@ -4,8 +4,8 @@ Ideas
 -----
 * A *face* is a straight run of pieces joined by straight connectors. Its
   length is what matters for the outline; which pieces make it up is decided
-  afterwards (gate faces preferred, so the second-gate bonus is always taken
-  when the inventory allows it).
+  afterwards. Fitted candidates get a bounded retry for placing gates on
+  separate faces, retaining the original legal plan if the retry stops early.
 * Coordinates are exact: x = m + n*(sqrt(2)/2) with integer (m, n). A loop
   closes iff all four integers are zero, so diagonal faces whose irrational
   parts do not cancel are never produced.
@@ -89,13 +89,18 @@ class DiagonalSearch(Player):
     PERIM_BUCKET = 8  # beam keeps shapes of every size, not just the biggest
     REALIZE_NODE_LIMIT = 4000
     STATE_VARIANTS = 2  # Distinct boundary prefixes retained per resource state.
+    GATE_BONUS_SECONDS = 0.01  # Per closed-candidate retry, within the beam budget.
+    GATE_BONUS_FRACTION = 0.05  # All retries together use at most 5% of beam CPU.
 
     class OutOfTime(Exception):
         pass
 
-    def __init__(self, *args, time_budget=20.0, face_library=None, **kwargs) -> None:
+    def __init__(
+        self, *args, time_budget=20.0, face_library=None, incumbent_score=0.0, **kwargs
+    ) -> None:
         self.TIME_BUDGET = time_budget
         self.face_library = face_library
+        self.incumbent_score = incumbent_score
         # process_time() is what the simulator's CPU limit counts; the
         # constructor counts toward it, so the clock starts here.
         self._start = time.process_time()
@@ -172,16 +177,24 @@ class DiagonalSearch(Player):
             for length, options in comps.items()
         }
         self._realize_cache: dict[tuple, list | None] = {}
+        self._gated_realize_cache: dict[tuple, list | None] = {}
+        self._gate_bonus_cpu = 0.0
 
-    def realize(self, lengths: tuple[int, ...]):
+    def realize(self, lengths: tuple[int, ...], *, min_gate_faces=0, stop=None):
         """Assign a piece composition to each face length (a sorted tuple).
         Gate-containing compositions are tried first. Returns a list aligned
         with `lengths`, or None if no assignment was found. Only exhaustive
-        failures are cached; a CPU/node cutoff leaves the query retryable."""
-        if lengths in self._realize_cache:
-            return self._realize_cache[lengths]
-        if any(length not in self._realize_options for length in lengths):
-            self._realize_cache[lengths] = None
+        failures are cached; a CPU/node cutoff leaves the query retryable.
+        Gate constraints use a separate cache and count faces, not gate pieces.
+        """
+        cache = self._gated_realize_cache if min_gate_faces else self._realize_cache
+        cache_key = (lengths, min_gate_faces) if min_gate_faces else lengths
+        if cache_key in cache:
+            return cache[cache_key]
+        if min_gate_faces > min(self.total_gates, len(lengths)) or any(
+            length not in self._realize_options for length in lengths
+        ):
+            cache[cache_key] = None
             return None
         # Assign the most constrained faces first, preserving gate-first
         # composition order and the caller's original face ordering.
@@ -194,14 +207,18 @@ class DiagonalSearch(Player):
         failed = set()
         nodes_left = self.REALIZE_NODE_LIMIT
 
-        def dfs(k, straights_left):
+        def dfs(k, straights_left, gates_needed):
             nonlocal nodes_left
-            if self.out_of_time():
+            if self.out_of_time() or (stop is not None and stop()):
                 return None  # Unknown, rather than proven infeasible.
             if k == len(order):
-                return True
+                return gates_needed == 0
             state = (k, straights_left, tuple(remaining))
+            if min_gate_faces:
+                state += (gates_needed,)
             if state in failed:
+                return False
+            if len(order) - k < gates_needed:
                 return False
             if nodes_left <= 0:
                 return None
@@ -214,7 +231,11 @@ class DiagonalSearch(Player):
                 for p, n in need:
                     remaining[p] -= n
                 assign[i] = comp
-                outcome = dfs(k + 1, straights_left - straights)
+                outcome = dfs(
+                    k + 1,
+                    straights_left - straights,
+                    max(0, gates_needed - (comp[1] > 0)),
+                )
                 for p, n in need:
                     remaining[p] += n
                 if outcome is not False:
@@ -222,11 +243,39 @@ class DiagonalSearch(Player):
             failed.add(state)
             return False
 
-        outcome = dfs(0, self.straight_count)
+        outcome = dfs(0, self.straight_count, min_gate_faces)
         result = assign if outcome is True else None
         if outcome is not None:
-            self._realize_cache[lengths] = result
+            cache[cache_key] = result
         return result
+
+    def _improve_gate_assignment(self, lengths, assignment):
+        """Try the second-face bonus without losing a known legal fallback."""
+        if (
+            self.weights.G <= 0
+            or self.total_gates < 2
+            or sum(comp[1] > 0 for comp in assignment) >= 2
+        ):
+            return assignment
+        key = (lengths, 2)
+        if key in self._gated_realize_cache:
+            return self._gated_realize_cache[key] or assignment
+        started = time.process_time()
+        seconds = min(
+            self.GATE_BONUS_SECONDS,
+            self.TIME_BUDGET * self.GATE_BONUS_FRACTION - self._gate_bonus_cpu,
+            self.TIME_BUDGET - (started - self._start),
+        )
+        if seconds <= 0:
+            return assignment
+
+        def stopped():
+            return time.process_time() >= started + seconds
+
+        try:
+            return self.realize(lengths, min_gate_faces=2, stop=stopped) or assignment
+        finally:
+            self._gate_bonus_cpu += time.process_time() - started
 
     # ---- chain search --------------------------------------------------
 
@@ -396,8 +445,33 @@ class DiagonalSearch(Player):
         seen: set = set()
         fit_cache: dict = {}
 
-        def process(closed):
+        def threshold():
+            return max(
+                self.incumbent_score - BASELINE_SCORE,
+                best[0] if best is not None else -math.inf,
+            )
+
+        def consider(key, per_face, fit):
             nonlocal best
+            construction = self.to_construction(key, per_face, fit)
+            result = validate_construction(construction, self.room, self.inventory)
+            if not result.valid:
+                return False
+            score = score_construction(result, self.weights) - BASELINE_SCORE
+            if score > threshold():
+                best = (score, key, per_face, fit)
+                self.history.append(
+                    (time.process_time() - self._start, BASELINE_SCORE + score)
+                )
+            return True
+
+        def order_assignment(key, lengths, assignment):
+            pool = {}
+            for length, comp in zip(lengths, assignment):
+                pool.setdefault(length, []).append(comp)
+            return [pool[length].pop(0) for length, _ in key]
+
+        def process(closed):
             cands = []
             for faces, _perim in closed:
                 key = DiagonalSearch.canonical(faces)
@@ -412,19 +486,16 @@ class DiagonalSearch(Player):
             for pot, key, poly in cands:
                 if self.out_of_time():
                     raise DiagonalSearch.OutOfTime()
-                if best is not None and pot <= best[0]:
+                if pot <= threshold():
                     break
                 lengths = tuple(sorted(f[0] for f in key))
                 assign = self.realize(lengths)
                 if assign is None:
                     continue
-                pool: dict[int, list] = {}
-                for ln, comp in zip(lengths, assign):
-                    pool.setdefault(ln, []).append(comp)
-                per_face = [pool[f[0]].pop(0) for f in key]
-                gate_faces = sum(1 for c in per_face if c[1] > 0)
-                if gate_faces == 0:
-                    continue
+                if not any(comp[1] > 0 for comp in assign):
+                    assign = self.realize(lengths, min_gate_faces=1)
+                    if assign is None:
+                        continue
                 if key not in fit_cache:
                     fit_cache[key] = find_fit(
                         room_poly, poly, angles=self.fit_angles(), stop=self.out_of_time
@@ -434,16 +505,13 @@ class DiagonalSearch(Player):
                 fit = fit_cache[key]
                 if fit is None:
                     continue
-                construction = self.to_construction(key, per_face, fit)
-                result = validate_construction(construction, self.room, self.inventory)
-                if not result.valid:
+                per_face = order_assignment(key, lengths, assign)
+                # Publish the legal baseline before spending time on the bonus.
+                if not consider(key, per_face, fit) or pot <= threshold():
                     continue
-                score = score_construction(result, self.weights) - BASELINE_SCORE
-                if best is None or score > best[0]:
-                    best = (score, key, per_face, fit)
-                    self.history.append(
-                        (time.process_time() - self._start, BASELINE_SCORE + score)
-                    )
+                improved = self._improve_gate_assignment(lengths, assign)
+                if improved is not assign:
+                    consider(key, order_assignment(key, lengths, improved), fit)
 
         # Iterative widening: start narrow, then widen until the global beam
         # stops truncating or the CPU budget is spent. The per-state outline

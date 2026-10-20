@@ -176,6 +176,7 @@ class DynamicRunTests(unittest.TestCase):
             beam.return_value.build_enclosure.return_value = None
             player.build_enclosure()
         self.assertGreater(beam.call_args.kwargs["time_budget"], 250)
+        self.assertEqual(beam.call_args.kwargs["incumbent_score"], player.best_score)
         self.assertAlmostEqual(player.budget_info.local_seconds, 14.75)
 
     def test_beam_upper_bound_safely_skips_uncompetitive_large_room_search(self):
