@@ -89,15 +89,15 @@ class MeasuredPlayer(Player6):
 
 
 def run_case(
-    name,
-    scenario,
-    variant,
-    *,
-    search_seconds=45.0,
-    grid_seconds=None,
-    beam_seconds=None,
-    local_seconds=None,
-    repeat=1,
+        name,
+        scenario,
+        variant,
+        *,
+        search_seconds=45.0,
+        grid_seconds=None,
+        beam_seconds=None,
+        local_seconds=None,
+        repeat=1,
 ):
     player = None
     construction = None
@@ -148,7 +148,7 @@ def run_case(
             second_gate_bonus=result.second_gate_bonus,
         )
     row["inventory_unchanged"] = (
-        player is None or player.inventory == scenario.inventory
+            player is None or player.inventory == scenario.inventory
     )
     row["grid_cpu_seconds"] = player.grid_cpu_seconds if player is not None else 0.0
     row["beam_skipped"] = getattr(player, "beam_skipped", False)
@@ -168,14 +168,14 @@ def run_case(
         row[f"local_{key}"] = stats.get(key, 0)
     budget = getattr(player, "budget_info", None)
     for key in (
-        "cpu_limit",
-        "available_seconds",
-        "usable_seconds",
-        "safety_seconds",
-        "grid_seconds",
-        "beam_seconds",
-        "local_seconds",
-        "source",
+            "cpu_limit",
+            "available_seconds",
+            "usable_seconds",
+            "safety_seconds",
+            "grid_seconds",
+            "beam_seconds",
+            "local_seconds",
+            "source",
     ):
         row[f"budget_{key}"] = getattr(budget, key, None)
     return row
@@ -242,13 +242,13 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
     if (
-        args.repeats < 1
-        or not math.isfinite(args.search_seconds)
-        or args.search_seconds <= 0
-        or any(
-            value is not None and (not math.isfinite(value) or value < 0)
-            for value in (args.grid_seconds, args.beam_seconds, args.local_seconds)
-        )
+            args.repeats < 1
+            or not math.isfinite(args.search_seconds)
+            or args.search_seconds <= 0
+            or any(
+        value is not None and (not math.isfinite(value) or value < 0)
+        for value in (args.grid_seconds, args.beam_seconds, args.local_seconds)
+    )
     ):
         parser.error(
             "repeats/search budget must be positive; other budgets must be nonnegative"

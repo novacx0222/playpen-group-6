@@ -41,7 +41,7 @@ class Local45Tests(unittest.TestCase):
         search = Local45Search(self.room, self.inventory, self.weights)
         improved = search.improve(self.seed)
         result = self.result(improved)
-        self.assertAlmostEqual(result.area, 100 + 50 * 2**0.5)
+        self.assertAlmostEqual(result.area, 100 + 50 * 2 ** 0.5)
         self.assertAlmostEqual(
             score_construction(result, self.weights), 1191.4213562373095
         )
@@ -67,7 +67,7 @@ class Local45Tests(unittest.TestCase):
         result = self.result(
             Local45Search(self.room, self.inventory, self.weights).improve(self.seed)
         )
-        self.assertAlmostEqual(result.area, 100 + 50 * 2**0.5)
+        self.assertAlmostEqual(result.area, 100 + 50 * 2 ** 0.5)
 
     def test_clockwise_seed_has_same_improvement(self):
         shape = make_shape(
@@ -77,7 +77,7 @@ class Local45Tests(unittest.TestCase):
         result = self.result(
             Local45Search(self.room, self.inventory, self.weights).improve(self.seed)
         )
-        self.assertAlmostEqual(result.area, 100 + 50 * 2**0.5)
+        self.assertAlmostEqual(result.area, 100 + 50 * 2 ** 0.5)
 
     def test_start_in_middle_of_straight_face_preserves_gate_and_closure(self):
         shape = make_shape(
@@ -94,7 +94,7 @@ class Local45Tests(unittest.TestCase):
         result = self.result(
             Local45Search(self.room, self.inventory, self.weights).improve(self.seed)
         )
-        self.assertAlmostEqual(result.area, 100 + 50 * 2**0.5)
+        self.assertAlmostEqual(result.area, 100 + 50 * 2 ** 0.5)
         self.assertEqual(result.gate_count, 1)
 
     def test_bounded_translation_can_fit_move_when_seed_is_off_center(self):
@@ -102,7 +102,7 @@ class Local45Tests(unittest.TestCase):
         result = self.result(
             Local45Search(self.room, self.inventory, self.weights).improve(self.seed)
         )
-        self.assertAlmostEqual(result.area, 100 + 50 * 2**0.5)
+        self.assertAlmostEqual(result.area, 100 + 50 * 2 ** 0.5)
 
     def test_missing_diagonal_connectors_keeps_seed(self):
         self.inventory.connectors[CT.DIAGONAL] = 3

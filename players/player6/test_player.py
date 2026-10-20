@@ -284,7 +284,7 @@ class IterativeFitRegressionTests(unittest.TestCase):
         player = self.make_player(inventory)
         original = inventory.copy()
         with patch(
-            "players.player6.player.find_fit", side_effect=lambda q, p: (p, (0, 0, 0))
+                "players.player6.player.find_fit", side_effect=lambda q, p: (p, (0, 0, 0))
         ):
             construction = player.build_enclosure()
         self.assertIsNotNone(construction)

@@ -54,7 +54,7 @@ class AllocationTests(unittest.TestCase):
 
     def test_active_simulator_limit_overrides_different_cli_limit(self):
         with patch.object(
-            time_budget, "active_framework_limit", return_value=(10, 0.8)
+                time_budget, "active_framework_limit", return_value=(10, 0.8)
         ):
             budget = time_budget.make_budget(self.inventory, argv=["--cpu-limit=300"])
         self.assertEqual(budget.cpu_limit, 10)
@@ -64,7 +64,7 @@ class AllocationTests(unittest.TestCase):
 
     def test_explicit_api_budget_still_respects_shorter_external_timer(self):
         with patch.object(
-            time_budget, "active_framework_limit", return_value=(10, 0.4)
+                time_budget, "active_framework_limit", return_value=(10, 0.4)
         ):
             budget = time_budget.make_budget(self.inventory, cpu_limit=2)
         self.assertAlmostEqual(budget.available_seconds, 0.4)

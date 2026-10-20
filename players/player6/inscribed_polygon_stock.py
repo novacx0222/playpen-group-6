@@ -148,13 +148,13 @@ def _dfs(ctx, k, node_limit, piece_cap=None, stop=None):
         wall_left = ctx["suffix_len"][ti] - done * need[ti][0]
         runs_left = ctx["suffix_runs"][ti] - done
         if wall_left > sum(
-            length * c for length, c in zip(piece_lengths, stk)
+                length * c for length, c in zip(piece_lengths, stk)
         ) or runs_left > sum(stk):
             return False
         # Pieces so far + fewest still needed.
         if (
-            piece_cap is not None
-            and total0 - sum(stk) + left * minp[ti] + suffix_minp[ti + 1] > piece_cap
+                piece_cap is not None
+                and total0 - sum(stk) + left * minp[ti] + suffix_minp[ti + 1] > piece_cap
         ):
             return False
         has_type = any(h for _, _, h in comps[ti])
@@ -203,15 +203,15 @@ def _dfs(ctx, k, node_limit, piece_cap=None, stop=None):
 
 
 def assign_inventory(
-    runs,
-    walls,
-    gates,
-    angle_stock=None,
-    *,
-    stop=None,
-    node_limit=200_000,
-    min_gate_faces=1,
-    prefer_two=True,
+        runs,
+        walls,
+        gates,
+        angle_stock=None,
+        *,
+        stop=None,
+        node_limit=200_000,
+        min_gate_faces=1,
+        prefer_two=True,
 ):
     """Assign typed (0=gate, 1=wall) pieces, preferring two actual gate faces.
 
@@ -337,12 +337,12 @@ def class_usable(stock, must_use, copy_cap=64, stop=None):
 
             def move(x, length=length):
                 return (
-                    x | (x << length) | (x >> length)
+                        x | (x << length) | (x >> length)
                 ) & full  # skip / side A / side B
 
             if length in cls:
                 with_cls = (
-                    move(with_cls) | ((no_cls << length) | (no_cls >> length)) & full
+                        move(with_cls) | ((no_cls << length) | (no_cls >> length)) & full
                 )
             else:
                 no_cls, with_cls = move(no_cls), move(with_cls)
@@ -366,7 +366,7 @@ def class_fits_in_run(stock, must_use, cell, stop=None):
 
 
 def assign_pieces(
-    runs, stock, must_use=None, node_limit=200_000, piece_cap=None, stop=None
+        runs, stock, must_use=None, node_limit=200_000, piece_cap=None, stop=None
 ):
     """
     Can every run be split into collinear pieces from stock?
@@ -455,22 +455,21 @@ def plan_is_valid(runs, plan, stock, must_use=None):
 
 # ---------------------------------------------------------------- candidates
 def best_rectangle(
-    poly,
-    stock,
-    must_use=None,
-    angle_stock=None,
-    angles=None,
-    n_off=3,
-    *,
-    stop=None,
-    plan_for=None,
-    on_candidate=None,
+        poly,
+        stock,
+        must_use=None,
+        angle_stock=None,
+        angles=None,
+        n_off=3,
+        *,
+        stop=None,
+        plan_for=None,
+        on_candidate=None,
 ):
     """Largest axis-aligned (in some candidate frame) rectangle, sides
     5..30 in steps of 5, whose 4 walls are buildable from stock."""
     sizes = []
     if plan_for is None:
-
         def plan_for(runs):
             return buildable(runs, stock, must_use, angle_stock, stop=stop)
 
@@ -512,10 +511,10 @@ def best_rectangle(
             if wc > W or hc > H:
                 continue
             win = (
-                S[hc:, wc:]
-                - S[: H + 1 - hc, wc:]
-                - S[hc:, : W + 1 - wc]
-                + S[: H + 1 - hc, : W + 1 - wc]
+                    S[hc:, wc:]
+                    - S[: H + 1 - hc, wc:]
+                    - S[hc:, : W + 1 - wc]
+                    + S[: H + 1 - hc, : W + 1 - wc]
             )
             hits = np.argwhere(win == wc * hc)
             if len(hits):
@@ -542,15 +541,15 @@ def _shrunk(poly, d):
 
 
 def shrink_search(
-    poly,
-    stock,
-    must_use=None,
-    angle_stock=None,
-    *,
-    stop=None,
-    plan_for=None,
-    on_candidate=None,
-    **kw,
+        poly,
+        stock,
+        must_use=None,
+        angle_stock=None,
+        *,
+        stop=None,
+        plan_for=None,
+        on_candidate=None,
+        **kw,
 ):
     """Smallest inward offset d (integer units) whose re-solved boundary is
     buildable. Probes use cheap solver settings; the winning d is re-solved at
@@ -559,7 +558,6 @@ def shrink_search(
     fast.setdefault("n_off", 1)
     fast.setdefault("top_k", 2)
     if plan_for is None:
-
         def plan_for(runs):
             return buildable(runs, stock, must_use, angle_stock, stop=stop)
 
@@ -598,17 +596,17 @@ def shrink_search(
 
 
 def _search(
-    poly,
-    stock,
-    cells,
-    must_use,
-    bonus_weight,
-    angle_stock=None,
-    *,
-    gate_stock=None,
-    stop=None,
-    evaluate=None,
-    **kw,
+        poly,
+        stock,
+        cells,
+        must_use,
+        bonus_weight,
+        angle_stock=None,
+        *,
+        gate_stock=None,
+        stop=None,
+        evaluate=None,
+        **kw,
 ):
     stock = clean_stock(stock)
     cands = []
@@ -704,17 +702,17 @@ def _search(
 
 
 def solve_with_stock(
-    poly,
-    stock,
-    cells=(5, 10, 15),
-    must_use=None,
-    bonus_weight=0.0,
-    on_class_impossible="fallback",
-    angle_stock=None,
-    gate_stock=None,
-    stop=None,
-    evaluate=None,
-    **kw,
+        poly,
+        stock,
+        cells=(5, 10, 15),
+        must_use=None,
+        bonus_weight=0.0,
+        on_class_impossible="fallback",
+        angle_stock=None,
+        gate_stock=None,
+        stop=None,
+        evaluate=None,
+        **kw,
 ):
     """
     Returns (polygon, piece_plan, how) or (None, None, 'infeasible').
@@ -778,7 +776,7 @@ def solve_with_stock(
             if not class_usable(stock, must_use, stop=stop):
                 why = "balance-impossible"
             elif not any(
-                class_fits_in_run(stock, must_use, c, stop=stop) for c in cells
+                    class_fits_in_run(stock, must_use, c, stop=stop) for c in cells
             ):
                 why = "needs-wall-shifting"
         except ip.SearchStopped:
