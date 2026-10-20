@@ -88,6 +88,7 @@ class DiagonalSearch(Player):
     BEAM_WIDTH = 150  # first pass; widened x4 while time allows
     PERIM_BUCKET = 8  # beam keeps shapes of every size, not just the biggest
     REALIZE_NODE_LIMIT = 4000
+    STATE_VARIANTS = 2  # Distinct boundary prefixes retained per resource state.
 
     class OutOfTime(Exception):
         pass
@@ -444,9 +445,9 @@ class DiagonalSearch(Player):
                         (time.process_time() - self._start, BASELINE_SCORE + score)
                     )
 
-        # Iterative widening: a cheap narrow beam first (answer within a
-        # moment), then ever wider ones, until the beam stops truncating
-        # (search is then exhaustive) or the CPU budget is spent.
+        # Iterative widening: start narrow, then widen until the global beam
+        # stops truncating or the CPU budget is spent. The per-state outline
+        # cap remains a heuristic even when the global beam is wide enough.
         try:
             width = self.BEAM_WIDTH
             while True:
@@ -460,13 +461,15 @@ class DiagonalSearch(Player):
                         if self.out_of_time():
                             raise DiagonalSearch.OutOfTime()
                         for c in self.expand(ch, closed):
-                            key = (c.pos, c.turn, tuple(sorted(f[0] for f in c.faces)))
-                            sc = self._closed_score(c.verts, c.perim)
-                            old = nxt.get(key)
-                            if old is None or sc > old[0]:
-                                nxt[key] = (sc, c)
+                            self._keep_chain(nxt, c)
                     process(closed)
-                    beam = self.select_beam(list(nxt.values()))
+                    beam = self.select_beam(
+                        [
+                            candidate
+                            for variants in nxt.values()
+                            for candidate in variants
+                        ]
+                    )
                     if not beam:
                         break
                 if not self._truncated:
@@ -475,6 +478,34 @@ class DiagonalSearch(Player):
         except DiagonalSearch.OutOfTime:
             self.note = "CPU budget reached; returning best found so far"
         return best
+
+    def _keep_chain(self, groups, chain):
+        """Keep a bounded set of exact, distinct outlines for each resource state.
+
+        Equal endpoints, headings and lengths do not imply equal futures:
+        connector budgets and the existing boundary affect legal completions.
+        Face sequences identify outlines exactly, without float rounding.
+        """
+        key = (
+            chain.pos,
+            chain.turn,
+            tuple(sorted(length for length, _ in chain.faces)),
+            chain.right,
+            chain.diag,
+            chain.straights,
+        )
+        variants = groups.get(key)
+        if variants is None:
+            groups[key] = [(self._closed_score(chain.verts, chain.perim), chain)]
+            return
+        if any(previous.faces == chain.faces for _, previous in variants):
+            return
+        score = self._closed_score(chain.verts, chain.perim)
+        if len(variants) >= self.STATE_VARIANTS and score <= variants[-1][0]:
+            return
+        variants.append((score, chain))
+        variants.sort(key=lambda candidate: -candidate[0])
+        del variants[self.STATE_VARIANTS :]
 
     def select_beam(self, scored):
         """Top `_width` states, split evenly over perimeter bands so small
