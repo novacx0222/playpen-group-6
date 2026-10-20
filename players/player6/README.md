@@ -35,12 +35,12 @@ Reserve 3% of the configured limit for returning safely (minimum 0.05 seconds,
 maximum 5 seconds, and never more than 20% of the remaining time). Allocate the
 remaining CPU time as an initial policy:
 
-| Stage | Share | 60-second limit | 300-second limit |
-|---|---:|---:|---:|
-| Orthogonal candidates and placement | 45% | 26.19 s | 132.75 s |
-| Beam search with 45-degree turns | 50% | 29.10 s | 147.50 s |
-| Local 45-degree refinement | 5% | 2.91 s | 14.75 s |
-| Safety reserve | | 1.80 s | 5.00 s |
+| Stage                               | Share | 60-second limit | 300-second limit |
+|-------------------------------------|------:|----------------:|-----------------:|
+| Orthogonal candidates and placement |   45% |         26.19 s |         132.75 s |
+| Beam search with 45-degree turns    |   50% |         29.10 s |         147.50 s |
+| Local 45-degree refinement          |    5% |          2.91 s |          14.75 s |
+| Safety reserve                      |       |          1.80 s |           5.00 s |
 
 These nominal figures assume negligible constructor time. Within the first
 stage, grid construction gets 30% of usable CPU and rectangle/L placement gets
@@ -116,8 +116,8 @@ statistics, allocated CPU budgets, beam pruning, and whether the input inventory
 is expected for the deliberately insufficient-stock case and scores zero.
 
 `baseline` runs the current grid + rectangle/L + beam strategy with local moves
-disabled. `local45` enables the local pass. Both have the same overall CPU limit
-(45 seconds by default for this benchmark command) and use automatic stage
+disabled. `local45` enables the local pass. Both have the same overall CPU limit (45 seconds by default for this
+benchmark command) and use automatic stage
 allocation unless caps are supplied. The simulator guard uses that exact total
 limit, including player construction. Each row records the actual allocation.
 
