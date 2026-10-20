@@ -17,6 +17,7 @@ Ideas
 
 import math
 import time
+from collections import Counter
 
 from shapely import Polygon
 
@@ -86,6 +87,7 @@ class DiagonalSearch(Player):
     MAX_FACES = 12
     BEAM_WIDTH = 150  # first pass; widened x4 while time allows
     PERIM_BUCKET = 8  # beam keeps shapes of every size, not just the biggest
+    REALIZE_NODE_LIMIT = 4000
 
     class OutOfTime(Exception):
         pass
@@ -157,52 +159,72 @@ class DiagonalSearch(Player):
         self.min_straights = {
             length: min(c[2] for c in cs) for length, cs in comps.items()
         }
+        stock_index = {piece: i for i, piece in enumerate(self.stock)}
+        self._stock_counts = tuple(self.stock.values())
+        # Material demand never changes between calls: count repeated pieces
+        # once instead of rebuilding a dictionary at every DFS branch.
+        self._realize_options = {
+            length: [
+                (comp, tuple((stock_index[p], n) for p, n in Counter(comp[0]).items()))
+                for comp in options
+            ]
+            for length, options in comps.items()
+        }
         self._realize_cache: dict[tuple, list | None] = {}
 
     def realize(self, lengths: tuple[int, ...]):
         """Assign a piece composition to each face length (a sorted tuple).
         Gate-containing compositions are tried first. Returns a list aligned
-        with `lengths`, or None if the inventory cannot supply them."""
+        with `lengths`, or None if no assignment was found. Only exhaustive
+        failures are cached; a CPU/node cutoff leaves the query retryable."""
         if lengths in self._realize_cache:
             return self._realize_cache[lengths]
-        order = sorted(range(len(lengths)), key=lambda i: -lengths[i])
-        remaining = dict(self.stock)
+        if any(length not in self._realize_options for length in lengths):
+            self._realize_cache[lengths] = None
+            return None
+        # Assign the most constrained faces first, preserving gate-first
+        # composition order and the caller's original face ordering.
+        order = sorted(
+            range(len(lengths)),
+            key=lambda i: (len(self._realize_options[lengths[i]]), -lengths[i]),
+        )
+        remaining = list(self._stock_counts)
         assign: list = [None] * len(lengths)
-        budget = [4000]
+        failed = set()
+        nodes_left = self.REALIZE_NODE_LIMIT
 
         def dfs(k, straights_left):
+            nonlocal nodes_left
             if self.out_of_time():
-                return False
+                return None  # Unknown, rather than proven infeasible.
             if k == len(order):
                 return True
-            budget[0] -= 1
-            if budget[0] < 0:
+            state = (k, straights_left, tuple(remaining))
+            if state in failed:
                 return False
+            if nodes_left <= 0:
+                return None
+            nodes_left -= 1
             i = order[k]
-            for comp in self.comps[lengths[i]]:
-                pieces, _, s = comp
-                if s > straights_left:
+            for comp, need in self._realize_options[lengths[i]]:
+                straights = comp[2]
+                if straights > straights_left or any(remaining[p] < n for p, n in need):
                     continue
-                need: dict = {}
-                ok = True
-                for p in pieces:
-                    need[p] = need.get(p, 0) + 1
-                    if need[p] > remaining.get(p, 0):
-                        ok = False
-                        break
-                if not ok:
-                    continue
-                for p, c in need.items():
-                    remaining[p] -= c
+                for p, n in need:
+                    remaining[p] -= n
                 assign[i] = comp
-                if dfs(k + 1, straights_left - s):
-                    return True
-                for p, c in need.items():
-                    remaining[p] += c
+                outcome = dfs(k + 1, straights_left - straights)
+                for p, n in need:
+                    remaining[p] += n
+                if outcome is not False:
+                    return outcome
+            failed.add(state)
             return False
 
-        result = assign if dfs(0, self.straight_count) else None
-        self._realize_cache[lengths] = result
+        outcome = dfs(0, self.straight_count)
+        result = assign if outcome is True else None
+        if outcome is not None:
+            self._realize_cache[lengths] = result
         return result
 
     # ---- chain search --------------------------------------------------
