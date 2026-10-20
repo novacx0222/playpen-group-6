@@ -64,6 +64,14 @@ at most two distinct exact boundary prefixes before the existing global beam
 selection. This preserves some geometric diversity without increasing the
 global beam width; the per-state cap remains heuristic.
 
+Material assignment rejects outlines whose total length exceeds the longest
+stock pieces usable with the available straight connectors: `n` faces and `s`
+straight connectors can use at most `n+s` pieces. Only proven failures enter
+the permanent feasibility cache. Queries stopped by a node/CPU cutoff are
+deferred for the current beam pass and retried after widening, instead of
+restarting for every outline with the same face lengths. Closed outlines with
+deferred assignments remain eligible for evaluation in the next pass.
+
 Closed beam candidates must have at least one gate face. After placement, a
 validated baseline is retained before retrying material assignment for two
 distinct gate faces. Gate-constrained queries have separate caches from prefix

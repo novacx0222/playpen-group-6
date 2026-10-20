@@ -167,6 +167,17 @@ class DiagonalSearch(Player):
         }
         stock_index = {piece: i for i, piece in enumerate(self.stock)}
         self._stock_counts = tuple(self.stock.values())
+        # n faces and s straight connectors can use at most n+s pieces.
+        # Even taking the longest available pieces must cover their length.
+        # This rejects impossible long outlines before composition DFS.
+        self._max_realize_length = [0]
+        piece_limit = self.MAX_FACES + self.straight_count
+        for (_, length), count in sorted(
+            self.stock.items(), key=lambda item: -item[0][1]
+        ):
+            for _ in range(min(count, piece_limit)):
+                self._max_realize_length.append(self._max_realize_length[-1] + length)
+            piece_limit -= min(count, piece_limit)
         # Material demand never changes between calls: count repeated pieces
         # once instead of rebuilding a dictionary at every DFS branch.
         self._realize_options = {
@@ -178,21 +189,37 @@ class DiagonalSearch(Player):
         }
         self._realize_cache: dict[tuple, list | None] = {}
         self._gated_realize_cache: dict[tuple, list | None] = {}
+        # Unknown queries are deferred only within one beam pass. They are
+        # separate from proven failures and can be retried after widening.
+        self._deferred_realize: set | None = None
         self._gate_bonus_cpu = 0.0
 
     def realize(self, lengths: tuple[int, ...], *, min_gate_faces=0, stop=None):
         """Assign a piece composition to each face length (a sorted tuple).
         Gate-containing compositions are tried first. Returns a list aligned
         with `lengths`, or None if no assignment was found. Only exhaustive
-        failures are cached; a CPU/node cutoff leaves the query retryable.
+        failures are cached; a CPU/node cutoff defers retries until the next
+        beam pass. Standalone calls remain immediately retryable.
         Gate constraints use a separate cache and count faces, not gate pieces.
         """
         cache = self._gated_realize_cache if min_gate_faces else self._realize_cache
         cache_key = (lengths, min_gate_faces) if min_gate_faces else lengths
         if cache_key in cache:
             return cache[cache_key]
+        query = (lengths, min_gate_faces)
+        if self._deferred_realize is not None and query in self._deferred_realize:
+            return None
         if min_gate_faces > min(self.total_gates, len(lengths)) or any(
             length not in self._realize_options for length in lengths
+        ):
+            cache[cache_key] = None
+            return None
+        piece_limit = min(
+            len(lengths) + self.straight_count, len(self._max_realize_length) - 1
+        )
+        if (
+            len(lengths) <= self.MAX_FACES
+            and sum(lengths) > self._max_realize_length[piece_limit]
         ):
             cache[cache_key] = None
             return None
@@ -247,6 +274,8 @@ class DiagonalSearch(Player):
         result = assign if outcome is True else None
         if outcome is not None:
             cache[cache_key] = result
+        elif self._deferred_realize is not None:
+            self._deferred_realize.add(query)
         return result
 
     def _improve_gate_assignment(self, lengths, assignment):
@@ -491,10 +520,16 @@ class DiagonalSearch(Player):
                 lengths = tuple(sorted(f[0] for f in key))
                 assign = self.realize(lengths)
                 if assign is None:
+                    # A deferred assignment is not a rejected outline: allow
+                    # the next widening pass to evaluate this shape again.
+                    if (lengths, 0) in self._deferred_realize:
+                        seen.discard(key)
                     continue
                 if not any(comp[1] > 0 for comp in assign):
                     assign = self.realize(lengths, min_gate_faces=1)
                     if assign is None:
+                        if (lengths, 1) in self._deferred_realize:
+                            seen.discard(key)
                         continue
                 if key not in fit_cache:
                     fit_cache[key] = find_fit(
@@ -519,6 +554,7 @@ class DiagonalSearch(Player):
         try:
             width = self.BEAM_WIDTH
             while True:
+                self._deferred_realize = set()
                 self._truncated = False
                 self._width = width
                 beam = [Chain((0, 0, 0, 0), 0, (), [(0.0, 0.0)], 0, 0, 0, 0)]
@@ -545,6 +581,8 @@ class DiagonalSearch(Player):
                 width *= 4
         except DiagonalSearch.OutOfTime:
             self.note = "CPU budget reached; returning best found so far"
+        finally:
+            self._deferred_realize = None
         return best
 
     def _keep_chain(self, groups, chain):
