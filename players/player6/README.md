@@ -8,7 +8,7 @@ are inside `players/player6/`.
 From the repository root:
 
 ```bash
-uv run python -m unittest players.player6.test_player players.player6.test_inscribed players.player6.test_local_search players.player6.test_benchmark players.player6.test_time_budget players.player6.test_integration
+uv run python -m unittest discover -s players/player6 -p 'test_*.py'
 uv run ruff check players/player6
 uv run python -m scripts.check_submission 6 --no-run
 ```
@@ -57,6 +57,29 @@ bound from its maximum perimeter, room area, inventory, and gate bonus. If even
 that bound cannot beat the incumbent, beam is skipped. This does not skip a
 potential improvement. In particular, extra CPU alone cannot make this small
 beam neighborhood competitive with the large spiral grid solution.
+
+Partial beam states distinguish consumed right, diagonal, and straight
+connectors as well as endpoint, direction, and edge lengths. Each state retains
+at most two distinct exact boundary prefixes before the existing global beam
+selection. This preserves some geometric diversity without increasing the
+global beam width; the per-state cap remains heuristic.
+
+Material assignment rejects outlines whose total length exceeds the longest
+stock pieces usable with the available straight connectors: `n` faces and `s`
+straight connectors can use at most `n+s` pieces. Only proven failures enter
+the permanent feasibility cache. Queries stopped by a node/CPU cutoff are
+deferred for the current beam pass and retried after widening, instead of
+restarting for every outline with the same face lengths. Closed outlines with
+deferred assignments remain eligible for evaluation in the next pass.
+
+Closed beam candidates must have at least one gate face. After placement, a
+validated baseline is retained before retrying material assignment for two
+distinct gate faces. Gate-constrained queries have separate caches from prefix
+feasibility checks. Each optional retry gets up to 0.01 CPU seconds; all such
+retries share at most 5% of the existing beam budget. A cutoff or impossible
+bonus keeps the original plan. The current Player6 score is also passed to
+beam search, so closed candidates whose optimistic score cannot improve it
+are skipped before placement.
 
 The percentages are starting values, not a measured optimum across all rooms.
 Increasing time cannot improve a stage whose candidate set is exhausted.

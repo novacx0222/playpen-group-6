@@ -977,6 +977,7 @@ class Player6(Player):
                     self.weights,
                     time_budget=seconds_left,
                     face_library=self.possible_faces or None,
+                    incumbent_score=self.best_score,
                 )
                 diagonal = search.build_enclosure()
                 self.beam_history = [
