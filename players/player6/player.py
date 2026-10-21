@@ -4,13 +4,14 @@ from collections import Counter
 from contextlib import contextmanager
 from itertools import combinations_with_replacement, product
 
-from shapely import Polygon
+from shapely import Polygon, affinity
 
 from players.player0 import Player
 from players.player6.diagonal_search import DiagonalSearch
+from players.player6.edge_push import EdgePush
 from players.player6.inscribed_polygon import SearchStopped, check_stop
 from players.player6.local_search import Local45Search, LocalSearchStats
-from players.player6.polygon import find_fit
+from players.player6.polygon import find_fit, room_search_angles
 from players.player6.time_budget import make_budget
 from src.constants import BASELINE_SCORE, MAX_FACE_LENGTH
 from src.enclosure import Construction, score_construction, validate_construction
@@ -18,6 +19,10 @@ from src.pieces import Connector, ConnectorType, Piece, PieceType
 
 
 class Player6(Player):
+    NOTCHED_BOXES = True
+    NOTCH_SECONDS = 3.0
+    EDGE_PUSH = True
+    PUSH_SECONDS = 5.0
     """Group 6: inventory-aware grid/beam search with local 45-degree refinement."""
 
     GATE = 0
@@ -591,6 +596,180 @@ class Player6(Player):
                             if score is not None and score >= upper:
                                 break
 
+    def generate_notched_boxes(self, seconds=None):
+        """Rectangles with a notch cut out of up to four corners.
+
+        A W x H box needs notches whenever a side exceeds the 30-unit face
+        cap, e.g. 48 across becomes a 30 face with two 9-wide notches.
+        Notches do not change the perimeter (2 * (W + H)), so the score only
+        depends on the area lost; candidates are tried in order of least area
+        lost and the search stops once none can beat the incumbent."""
+        right_have = self.inventory.connectors.get(ConnectorType.RIGHT, 0)
+        if right_have < 8 or not self.possible_faces:
+            return
+        deadline = time.process_time() + (seconds if seconds else math.inf)
+
+        def stopped():
+            return self._out_of_time() or time.process_time() >= deadline
+
+        lengths = sorted(self.possible_faces)
+        length_set = set(lengths)
+        angle = room_search_angles(self.room.polygon)[0]
+        rotated = affinity.rotate(self.room.polygon, -angle, origin=(0, 0))
+        bx0, by0, bx1, by1 = rotated.bounds
+        max_w, max_h = int(bx1 - bx0 + 1e-6), int(by1 - by0 + 1e-6)
+        if max_w <= MAX_FACE_LENGTH and max_h <= MAX_FACE_LENGTH:
+            return  # a plain rectangle is already as big as a box can get
+        if rotated.area < 0.8 * (bx1 - bx0) * (by1 - by0):
+            return  # too hollow: boxes would mostly fail to fit
+        bonus = self.weights.G if sum(self.inventory.gates.values()) >= 2 else 0
+        a_w, c_w = self.weights.A, self.weights.C
+
+        def best_possible(w, h, lost):
+            return 1000 + a_w * (w * h - lost) + c_w * 2 * (w + h) + bonus
+
+        realizer = DiagonalSearch(
+            self.room,
+            self.inventory,
+            self.weights,
+            time_budget=1e9,
+            face_library=self.possible_faces or None,
+        )
+        realizer.prepare_inventory()
+        sizes = [
+            (nx, ny)
+            for nx in lengths
+            for ny in lengths
+            if nx <= max_w - 5 and ny <= max_h - 5
+        ]
+        sizes.sort(key=lambda s: s[0] * s[1])
+        max_corners = (right_have - 4) // 2
+        pairs = [
+            (w, h)
+            for w in range(10, max_w + 1)
+            for h in range(10, max_h + 1)
+            if w > MAX_FACE_LENGTH or h > MAX_FACE_LENGTH
+        ]
+        # at least two notches are needed, each losing >= 25 units
+        pairs.sort(key=lambda wh: -best_possible(wh[0], wh[1], 50))
+        for w, h in pairs:
+            if stopped():
+                return
+            if best_possible(w, h, 50) <= self.best_score:
+                break
+            lost_max = (best_possible(w, h, 0) - self.best_score) / a_w
+            candidates = self._notch_candidates(
+                w, h, sizes, length_set, lost_max, max_corners, stopped
+            )
+            for lost, notches in candidates:
+                if stopped():
+                    return
+                if best_possible(w, h, lost) <= self.best_score:
+                    break
+                self._try_notched(w, h, notches, realizer)
+
+    def _notch_candidates(
+        self, w, h, sizes, length_set, lost_max, max_corners, stopped
+    ):
+        """All (area lost, {corner: (nx, ny)}) with legal face lengths, sorted."""
+        out = []
+        budget = [300_000]
+        corners = ("TL", "TR", "BL", "BR")
+
+        def get(chosen, corner, axis):
+            return chosen.get(corner, (0, 0))[axis]
+
+        def rec(index, chosen, lost):
+            if budget[0] <= 0 or stopped():
+                return
+            budget[0] -= 1
+            # check each side as soon as both of its corners are decided
+            if (
+                index == 2
+                and (w - get(chosen, "TL", 0) - get(chosen, "TR", 0)) not in length_set
+            ):
+                return
+            if (
+                index == 3
+                and (h - get(chosen, "TL", 1) - get(chosen, "BL", 1)) not in length_set
+            ):
+                return
+            if index == 4:
+                if len(chosen) < 2:
+                    return
+                bottom = w - get(chosen, "BL", 0) - get(chosen, "BR", 0)
+                right = h - get(chosen, "TR", 1) - get(chosen, "BR", 1)
+                if bottom in length_set and right in length_set:
+                    out.append((lost, dict(chosen)))
+                return
+            corner = corners[index]
+            rec(index + 1, chosen, lost)  # no notch here
+            if len(chosen) >= max_corners:
+                return
+            for nx, ny in sizes:
+                cost = nx * ny
+                if lost + cost > lost_max:
+                    break
+                chosen[corner] = (nx, ny)
+                rec(index + 1, chosen, lost + cost)
+                del chosen[corner]
+
+        rec(0, {}, 0)
+        out.sort(key=lambda item: item[0])
+        return out
+
+    def _try_notched(self, w, h, notches, realizer):
+        def notch(corner):
+            return notches.get(corner, (0, 0))
+
+        (nx_bl, ny_bl), (nx_br, ny_br) = notch("BL"), notch("BR")
+        (nx_tr, ny_tr), (nx_tl, ny_tl) = notch("TR"), notch("TL")
+        points = [(nx_bl, 0) if "BL" in notches else (0, 0)]
+        if "BR" in notches:
+            points += [(w - nx_br, 0), (w - nx_br, ny_br), (w, ny_br)]
+        else:
+            points += [(w, 0)]
+        if "TR" in notches:
+            points += [(w, h - ny_tr), (w - nx_tr, h - ny_tr), (w - nx_tr, h)]
+        else:
+            points += [(w, h)]
+        if "TL" in notches:
+            points += [(nx_tl, h), (nx_tl, h - ny_tl), (0, h - ny_tl)]
+        else:
+            points += [(0, h)]
+        if "BL" in notches:
+            points += [(0, ny_bl), (nx_bl, ny_bl)]
+        n = len(points)
+        lengths, turns = [], []
+        for i in range(n):
+            (x0, y0), (x1, y1), (x2, y2) = (
+                points[i],
+                points[(i + 1) % n],
+                points[(i + 2) % n],
+            )
+            lengths.append(abs(x1 - x0) + abs(y1 - y0))
+            cross = (x1 - x0) * (y2 - y1) - (y1 - y0) * (x2 - x1)
+            turns.append(90 if cross > 0 else -90)
+        if any(not 5 <= length <= MAX_FACE_LENGTH for length in lengths):
+            return None
+        polygon = Polygon(points)
+        if not polygon.is_valid:
+            return None
+        assignment = realizer.realize(tuple(sorted(lengths)))
+        if assignment is None:
+            return None
+        pool = {}
+        for length, comp in zip(sorted(lengths), assignment):
+            pool.setdefault(length, []).append(comp)
+        edges = []
+        for length in lengths:
+            pieces, _gates, straights = pool[length].pop(0)
+            edges.append(Player6.Edge(list(pieces), length, straights))
+        fit = self._fit_geometry(polygon)
+        if fit is None:
+            return None
+        return self._consider_shape(Player6.Shape(edges, turns, points), fit)
+
     def find_candidates(self, max_shapes=10) -> list[Shape]:
         """Build the material inventory, enumerate straight-face options, and
         combine them into candidate shapes before room placement."""
@@ -834,6 +1013,26 @@ class Player6(Player):
         finally:
             stats.cpu_seconds += time.process_time() - started
 
+    def _push_edges(self, deadline):
+        """Slide faces of the incumbent outward (see edge_push.py)."""
+        if not self.EDGE_PUSH or self.best_construction is None:
+            return
+        with self._phase("edge push"):
+            seconds = min(self.PUSH_SECONDS, deadline - time.process_time())
+            if seconds <= 0:
+                return
+            search = EdgePush(
+                self.room, self.inventory, self.weights, time_budget=seconds
+            )
+            improved = search.improve(self.best_construction)
+            if improved is not None:
+                result = validate_construction(improved, self.room, self.inventory)
+                if result.valid:
+                    score = score_construction(result, self.weights)
+                    if score > self.best_score:
+                        self.best_score = score
+                        self.best_construction = improved
+
     @contextmanager
     def _phase(self, name):
         started = time.process_time()
@@ -946,12 +1145,16 @@ class Player6(Player):
             self.enumerate_faces()  # complete any library truncated by the grid deadline
             self.generate_quads()
             self.generate_quad_shapes()
+            if self.NOTCHED_BOXES:
+                with self._phase("notched boxes"):
+                    self.generate_notched_boxes(self.NOTCH_SECONDS)
         if self.INSCRIBED_DIAGONALS:
             with self._phase("staircase 45"):
                 self._improve_staircases(self._deadline)
         # Use only spare orthogonal-stage time, preserving the beam budget.
         with self._phase("local 45"):
             self._improve_local(self._deadline)
+        self._push_edges(overall_deadline)
 
         # Reclaim unused grid/rectangle time, keeping the remaining local budget.
         local_left = max(0.0, budget.local_seconds - self._local_cpu_used())
@@ -993,6 +1196,7 @@ class Player6(Player):
 
         # A later beam result may have a useful local move too. Both calls
         # share the dynamic local budget and the same overall deadline.
+        self._push_edges(overall_deadline)
         with self._phase("local 45"):
             self._improve_local(overall_deadline)
         self._report_phases()
