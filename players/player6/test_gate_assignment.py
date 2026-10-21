@@ -97,7 +97,7 @@ class GateAssignmentTests(unittest.TestCase):
         baseline = search.realize(LENGTHS)
         search._gate_bonus_cpu = search.TIME_BUDGET * search.GATE_BONUS_FRACTION
         with patch.object(
-                search, "realize", side_effect=AssertionError("quota exceeded")
+            search, "realize", side_effect=AssertionError("quota exceeded")
         ):
             self.assertIs(search._improve_gate_assignment(LENGTHS, baseline), baseline)
         known = search.realize(LENGTHS, min_gate_faces=2)

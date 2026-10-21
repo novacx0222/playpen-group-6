@@ -59,7 +59,7 @@ def _segments_cross(p1, p2, p3, p4, eps=1e-9):
     d3 = _ccw(p1, p2, p3)
     d4 = _ccw(p1, p2, p4)
     return ((d1 > eps and d2 < -eps) or (d1 < -eps and d2 > eps)) and (
-            (d3 > eps and d4 < -eps) or (d3 < -eps and d4 > eps)
+        (d3 > eps and d4 < -eps) or (d3 < -eps and d4 > eps)
     )
 
 
@@ -96,7 +96,7 @@ class DiagonalSearch(Player):
         pass
 
     def __init__(
-            self, *args, time_budget=20.0, face_library=None, incumbent_score=0.0, **kwargs
+        self, *args, time_budget=20.0, face_library=None, incumbent_score=0.0, **kwargs
     ) -> None:
         self.TIME_BUDGET = time_budget
         self.face_library = face_library
@@ -173,7 +173,7 @@ class DiagonalSearch(Player):
         self._max_realize_length = [0]
         piece_limit = self.MAX_FACES + self.straight_count
         for (_, length), count in sorted(
-                self.stock.items(), key=lambda item: -item[0][1]
+            self.stock.items(), key=lambda item: -item[0][1]
         ):
             for _ in range(min(count, piece_limit)):
                 self._max_realize_length.append(self._max_realize_length[-1] + length)
@@ -210,7 +210,7 @@ class DiagonalSearch(Player):
         if self._deferred_realize is not None and query in self._deferred_realize:
             return None
         if min_gate_faces > min(self.total_gates, len(lengths)) or any(
-                length not in self._realize_options for length in lengths
+            length not in self._realize_options for length in lengths
         ):
             cache[cache_key] = None
             return None
@@ -218,8 +218,8 @@ class DiagonalSearch(Player):
             len(lengths) + self.straight_count, len(self._max_realize_length) - 1
         )
         if (
-                len(lengths) <= self.MAX_FACES
-                and sum(lengths) > self._max_realize_length[piece_limit]
+            len(lengths) <= self.MAX_FACES
+            and sum(lengths) > self._max_realize_length[piece_limit]
         ):
             cache[cache_key] = None
             return None
@@ -281,9 +281,9 @@ class DiagonalSearch(Player):
     def _improve_gate_assignment(self, lengths, assignment):
         """Try the second-face bonus without losing a known legal fallback."""
         if (
-                self.weights.G <= 0
-                or self.total_gates < 2
-                or sum(comp[1] > 0 for comp in assignment) >= 2
+            self.weights.G <= 0
+            or self.total_gates < 2
+            or sum(comp[1] > 0 for comp in assignment) >= 2
         ):
             return assignment
         key = (lengths, 2)
@@ -366,10 +366,10 @@ class DiagonalSearch(Player):
                 # degrees, repeated, closes by itself (second half is the
                 # first rotated), whatever the lengths.
                 if (
-                        nturn == 4
-                        and 2 * nf <= self.MAX_FACES
-                        and 2 * right <= self.right_count
-                        and 2 * diag <= self.diag_count
+                    nturn == 4
+                    and 2 * nf <= self.MAX_FACES
+                    and 2 * right <= self.right_count
+                    and 2 * diag <= self.diag_count
                 ):
                     half = (*ch.faces, (length, t))
                     closed.append((half + half, 2 * perim))
@@ -383,8 +383,8 @@ class DiagonalSearch(Player):
                 # new face must not cross earlier ones
                 v = ch.verts
                 if any(
-                        _segments_cross(v[i], v[i + 1], (px, py), (nx, ny))
-                        for i in range(len(v) - 2)
+                    _segments_cross(v[i], v[i + 1], (px, py), (nx, ny))
+                    for i in range(len(v) - 2)
                 ):
                     continue
                 if not self.may_fit([*v, (nx, ny)]):
@@ -410,8 +410,8 @@ class DiagonalSearch(Player):
             xs = [x * c - y * s for x, y in pts]
             ys = [x * s + y * c for x, y in pts]
             if (
-                    max(xs) - min(xs) <= self.room_w + 1e-9
-                    and max(ys) - min(ys) <= self.room_h + 1e-9
+                max(xs) - min(xs) <= self.room_w + 1e-9
+                and max(ys) - min(ys) <= self.room_h + 1e-9
             ):
                 return True
         return False
@@ -464,9 +464,9 @@ class DiagonalSearch(Player):
         ]
         room_area = room_poly.area
         if (
-                self.right_count + self.diag_count < 4
-                or not self.lengths
-                or self.total_gates < 1
+            self.right_count + self.diag_count < 4
+            or not self.lengths
+            or self.total_gates < 1
         ):
             return None
 
@@ -611,7 +611,7 @@ class DiagonalSearch(Player):
             return
         variants.append((score, chain))
         variants.sort(key=lambda candidate: -candidate[0])
-        del variants[self.STATE_VARIANTS:]
+        del variants[self.STATE_VARIANTS :]
 
     def select_beam(self, scored):
         """Top `_width` states, split evenly over perimeter bands so small

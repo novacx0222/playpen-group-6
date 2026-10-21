@@ -59,14 +59,14 @@ class Local45Search:
     MAX_WINDOW = 4
 
     def __init__(
-            self,
-            room,
-            inventory,
-            weights,
-            *,
-            time_budget=2.0,
-            stop=None,
-            on_improvement=None,
+        self,
+        room,
+        inventory,
+        weights,
+        *,
+        time_budget=2.0,
+        stop=None,
+        on_improvement=None,
     ):
         self.room = room
         self.inventory = inventory
@@ -78,7 +78,7 @@ class Local45Search:
 
     def stopped(self):
         return time.process_time() >= self.deadline or (
-                self.external_stop is not None and self.external_stop()
+            self.external_stop is not None and self.external_stop()
         )
 
     def place(self, polygon, origin, prepared_room):
@@ -220,7 +220,7 @@ class Local45Search:
                     if any(abs(turn) not in (1, 2) for turn in turns):
                         continue
                     if sum(
-                            abs(turn) == 2 for turn in turns
+                        abs(turn) == 2 for turn in turns
                     ) > self.inventory.connectors.get(ConnectorType.RIGHT, 0) or sum(
                         abs(turn) == 1 for turn in turns
                     ) > self.inventory.connectors.get(ConnectorType.DIAGONAL, 0):
@@ -246,10 +246,10 @@ class Local45Search:
                         continue
                     bonus = self.weights.G if result.second_gate_bonus or gates else 0
                     upper = (
-                            BASELINE_SCORE
-                            + self.weights.A * polygon.area
-                            + self.weights.C * polygon.length
-                            + bonus
+                        BASELINE_SCORE
+                        + self.weights.A * polygon.area
+                        + self.weights.C * polygon.length
+                        + bonus
                     )
                     if upper <= best_score + 1e-7:
                         continue

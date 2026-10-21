@@ -40,7 +40,7 @@ class Player6(Player):
         and gates using straight connectors."""
 
         def __init__(
-                self, pieces: list[tuple[int, int]], length: int, straight_count: int
+            self, pieces: list[tuple[int, int]], length: int, straight_count: int
         ) -> None:
             self.pieces = pieces.copy()
             self.length = length
@@ -57,10 +57,10 @@ class Player6(Player):
         turns[i] is the turn after edges[i], including the closing joint."""
 
         def __init__(
-                self,
-                edges: list["Player6.Edge"],
-                turns: list[int],
-                vertices: list[tuple[float, float]],
+            self,
+            edges: list["Player6.Edge"],
+            turns: list[int],
+            vertices: list[tuple[float, float]],
         ) -> None:
             self.edges = edges.copy()
             self.turns = turns.copy()
@@ -88,7 +88,7 @@ class Player6(Player):
             return self.to_construction(start, heading)
 
         def to_construction(
-                self, start: tuple[float, float], start_heading: float
+            self, start: tuple[float, float], start_heading: float
         ) -> Construction:
             """Expand faces into pieces and convert outgoing turns to vertex turns."""
             pieces = []
@@ -122,7 +122,7 @@ class Player6(Player):
         """Track remaining piece counts, connector counts, and total piece length."""
 
         def __init__(
-                self, materials: list[list[int]], right_count: int, straight_count: int
+            self, materials: list[list[int]], right_count: int, straight_count: int
         ) -> None:
             self.materials = materials
             self.total_piece_length = 0
@@ -233,7 +233,7 @@ class Player6(Player):
 
     @staticmethod
     def generate_shapes(
-            materials: Materials, edge_options: list[Edge], max_faces: int, max_shapes: int
+        materials: Materials, edge_options: list[Edge], max_faces: int, max_shapes: int
     ) -> list[Shape]:
         """Enumerate closed orthogonal polygons using left and right 90-degree
         turns. Enforce inventory limits, at least one gate, and polygon validity."""
@@ -249,13 +249,13 @@ class Player6(Player):
             return minimum_distance > maximum_distance
 
         def dfs(
-                position,
-                heading,
-                edges,
-                turns,
-                vertices,
-                total_turn,
-                remaining: Player6.Materials,
+            position,
+            heading,
+            edges,
+            turns,
+            vertices,
+            total_turn,
+            remaining: Player6.Materials,
         ) -> None:
             if len(edges) >= max_faces or len(shapes) >= max_shapes:
                 return
@@ -306,9 +306,9 @@ class Player6(Player):
                             continue
                         # At least one gate
                         if not any(
-                                piece_type == Player6.GATE
-                                for edge in next_edges
-                                for piece_type, _ in edge.pieces
+                            piece_type == Player6.GATE
+                            for edge in next_edges
+                            for piece_type, _ in edge.pieces
                         ):
                             continue
 
@@ -321,7 +321,7 @@ class Player6(Player):
                         )
                     else:
                         if cannot_return_to_origin(
-                                next_position, next_remaining, max_faces - len(next_edges)
+                            next_position, next_remaining, max_faces - len(next_edges)
                         ):
                             continue
 
@@ -378,10 +378,10 @@ class Player6(Player):
         """Include the baseline and the largest possible second-gate bonus."""
         bonus = self.weights.G if sum(self.inventory.gates.values()) >= 2 else 0
         return (
-                1000
-                + self.weights.A * polygon.area
-                + self.weights.C * polygon.length
-                + bonus
+            1000
+            + self.weights.A * polygon.area
+            + self.weights.C * polygon.length
+            + bonus
         )
 
     def _fit_geometry(self, polygon):
@@ -447,15 +447,15 @@ class Player6(Player):
                     if len(constructed) > straight_count:
                         continue
                     for kind, sizes in (
-                            (Player6.GATE, gate_sizes),
-                            (Player6.WALL, wall_sizes),
+                        (Player6.GATE, gate_sizes),
+                        (Player6.WALL, wall_sizes),
                     ):
                         if new_length not in sizes:
                             continue
                         piece = (kind, new_length)
                         if (new_length, kind) < (
-                                constructed[-1][1],
-                                constructed[-1][0],
+                            constructed[-1][1],
+                            constructed[-1][0],
                         ):
                             continue
                         candidate = constructed + [piece]
@@ -500,11 +500,11 @@ class Player6(Player):
                     combinations = (
                         (first[0], second[0], first[1], second[1])
                         for first in combinations_with_replacement(
-                        self.possible_faces[i], 2
-                    )
+                            self.possible_faces[i], 2
+                        )
                         for second in combinations_with_replacement(
-                        self.possible_faces[j], 2
-                    )
+                            self.possible_faces[j], 2
+                        )
                     )
                 for compositions in combinations:
                     if self._out_of_time():
@@ -696,9 +696,9 @@ class Player6(Player):
             deadline - time.process_time(),
         )
         if (
-                self.best_construction is None
-                or budget <= 0
-                or self.inventory.connectors.get(ConnectorType.DIAGONAL, 0) < 4
+            self.best_construction is None
+            or budget <= 0
+            or self.inventory.connectors.get(ConnectorType.DIAGONAL, 0) < 4
         ):
             return
         search = Local45Search(
@@ -779,8 +779,8 @@ class Player6(Player):
                             continue
                         new_len, new_turn, head0 = var
                         if (
-                                sum(abs(t) == 1 for t in new_turn) > max_diag
-                                or sum(abs(t) == 2 for t in new_turn) > max_right
+                            sum(abs(t) == 1 for t in new_turn) > max_diag
+                            or sum(abs(t) == 2 for t in new_turn) > max_right
                         ):
                             continue
                         verts, closure = idg.walk(new_len, new_turn)
@@ -790,7 +790,7 @@ class Player6(Player):
                         if not polygon.is_valid or polygon.area <= 0:
                             continue
                         if self._score_upper_bound(polygon) <= max(
-                                self.best_score, cur_score
+                            self.best_score, cur_score
                         ):
                             continue
                         if any(length not in realizer.comps for length in new_len):
@@ -841,7 +841,7 @@ class Player6(Player):
             yield
         finally:
             self.phase_seconds[name] = (
-                    self.phase_seconds.get(name, 0.0) + time.process_time() - started
+                self.phase_seconds.get(name, 0.0) + time.process_time() - started
             )
 
     def _report_phases(self):
@@ -878,7 +878,7 @@ class Player6(Player):
                 for length, count in self.inventory.gates.items()
                 if 5 <= length <= MAX_FACE_LENGTH
             )
-               >= 2
+            >= 2
             else 0
         )
         return BASELINE_SCORE + max(0, self.weights.A * area) + bonus
@@ -960,9 +960,9 @@ class Player6(Player):
             seconds_left = min(seconds_left, budget.beam_seconds)
         self.beam_upper_bound = self._beam_score_upper_bound()
         if (
-                has_diagonals
-                and seconds_left > 0
-                and self.beam_upper_bound + 1e-7 <= self.best_score
+            has_diagonals
+            and seconds_left > 0
+            and self.beam_upper_bound + 1e-7 <= self.best_score
         ):
             self.beam_skipped = True
             self.note += (

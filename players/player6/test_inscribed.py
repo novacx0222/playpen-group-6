@@ -117,7 +117,7 @@ class InscribedInventoryTests(unittest.TestCase):
     def test_bonus_timeout_retains_feasible_gate_assignment(self):
         feasible = {5: [(((0, 5),), 1), (((1, 5),), 3)]}
         with patch.object(
-                stock_solver, "_dfs", side_effect=[feasible, ip.SearchStopped()]
+            stock_solver, "_dfs", side_effect=[feasible, ip.SearchStopped()]
         ):
             plan = stock_solver.assign_inventory([5] * 4, {5: 3}, {5: 2})
         self.assertEqual(plan, feasible)
@@ -271,14 +271,14 @@ class InscribedSearchTests(unittest.TestCase):
 
     def test_inner_loops_honor_stop(self):
         for action in (
-                lambda: ip.enforce(np.ones((20, 20), dtype=bool), stop=lambda: True),
-                lambda: stock_solver.compositions(30, range(5, 16), stop=lambda: True),
-                lambda: stock_solver.shrink_search(
-                    box(0, 0, 40, 40), {5: 100}, stop=lambda: True
-                ),
-                lambda: stock_solver.assign_inventory(
-                    [5] * 4, {5: 3}, {5: 1}, stop=lambda: True
-                ),
+            lambda: ip.enforce(np.ones((20, 20), dtype=bool), stop=lambda: True),
+            lambda: stock_solver.compositions(30, range(5, 16), stop=lambda: True),
+            lambda: stock_solver.shrink_search(
+                box(0, 0, 40, 40), {5: 100}, stop=lambda: True
+            ),
+            lambda: stock_solver.assign_inventory(
+                [5] * 4, {5: 3}, {5: 1}, stop=lambda: True
+            ),
         ):
             with self.assertRaises(ip.SearchStopped):
                 action()

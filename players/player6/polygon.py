@@ -100,7 +100,7 @@ def place_at_angle(Q, P, theta_deg, eps=1e-9, obstacle_triangles=None):
 
 
 def find_fit(
-        Q, P, n_angles=8, tol=1e-7, max_cpu_seconds=2.0, *, angles=None, stop=None
+    Q, P, n_angles=8, tol=1e-7, max_cpu_seconds=2.0, *, angles=None, stop=None
 ):
     """Try at most eight room-oriented angles, with a bounded inner-fit search.
 
@@ -142,10 +142,10 @@ def find_fit(
                     return None
                 tx, ty = qx - px, qy - py
                 if (
-                        tx + px0 < qx0 - tol
-                        or tx + px1 > qx1 + tol
-                        or ty + py0 < qy0 - tol
-                        or ty + py1 > qy1 + tol
+                    tx + px0 < qx0 - tol
+                    or tx + px1 > qx1 + tol
+                    or ty + py0 < qy0 - tol
+                    or ty + py1 > qy1 + tol
                 ):
                     continue
                 placed = affinity.translate(rotated, xoff=tx, yoff=ty)

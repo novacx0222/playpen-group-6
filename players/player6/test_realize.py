@@ -82,7 +82,7 @@ class RealizeTests(unittest.TestCase):
         lengths = (15, 15)  # Total stock length suffices, but four pieces cannot.
         self.assertGreaterEqual(search.total_length, sum(lengths))
         with patch.object(
-                search, "out_of_time", side_effect=AssertionError("unnecessary DFS")
+            search, "out_of_time", side_effect=AssertionError("unnecessary DFS")
         ):
             self.assertIsNone(search.realize(lengths))
         self.assertIn(lengths, search._realize_cache)
@@ -100,7 +100,7 @@ class RealizeTests(unittest.TestCase):
         self.assertIsNone(search.realize(lengths))
         self.assertIn(lengths, search._realize_cache)  # Exhaustive, not a cutoff.
         with patch.object(
-                search, "out_of_time", side_effect=AssertionError("cache miss")
+            search, "out_of_time", side_effect=AssertionError("cache miss")
         ):
             self.assertIsNone(search.realize(lengths))
 
@@ -122,7 +122,7 @@ class RealizeTests(unittest.TestCase):
         self.assertNotIn(lengths, search._realize_cache)
         search.REALIZE_NODE_LIMIT = 4
         with patch.object(
-                search, "out_of_time", side_effect=AssertionError("restarted in same pass")
+            search, "out_of_time", side_effect=AssertionError("restarted in same pass")
         ):
             self.assertIsNone(search.realize(lengths))
         search._deferred_realize = set()  # The next widening pass can retry.
@@ -161,7 +161,7 @@ class RealizeTests(unittest.TestCase):
             )
             lengths = tuple(rng.choices((5, 6, 10, 11, 12), k=rng.randrange(5)))
             with self.subTest(
-                    stock=search.stock, lengths=lengths, straight=search.straight_count
+                stock=search.stock, lengths=lengths, straight=search.straight_count
             ):
                 expected = exhaustive_assignment_exists(search, lengths)
                 actual = search.realize(lengths)
