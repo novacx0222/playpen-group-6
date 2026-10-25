@@ -116,7 +116,9 @@ class Player3(Player):
         ]
         turn_lookup = dict(turns)
         max_depth = min(stock.count_pieces(), stock.count_connectors(), 40)
-        deadline = time.process_time() + self.SEARCH_SECONDS
+        deadline = getattr(
+            self, "SEARCH_DEADLINE", time.process_time() + self.SEARCH_SECONDS
+        )
         nodes = 0
         best, best_score = None, 0.0
 

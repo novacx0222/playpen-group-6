@@ -61,15 +61,21 @@ class Player2(Player):
         except SearchStopped:
             record("discovery", "stop", reason="deadline")
         if self.USE_DIAGONALS and self.best is not None and budget.remaining:
-            improve(
-                self.seeds,
-                self.geometry,
-                self.stock,
-                budget,
-                lambda shape, pose, local, floor: self._evaluate(
-                    shape, pose, local, floor, stage="diagonal"
-                ),
-            )
+            # Keep the initial states even when improvements replace live seeds.
+            seeds = tuple(self.seeds)
+            for margin in (0.01, 0.05, 0.20):
+                if not budget.remaining:
+                    break
+                improve(
+                    seeds,
+                    self.geometry,
+                    self.stock,
+                    budget,
+                    lambda shape, pose, local, floor: self._evaluate(
+                        shape, pose, local, floor, stage="diagonal"
+                    ),
+                    margin=margin,
+                )
         else:
             record(
                 "diagonal",

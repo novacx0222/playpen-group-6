@@ -1,3 +1,5 @@
+> Archived: this document describes a previous implementation. See [README.md](README.md) for the current strategy and benchmark procedure.
+
 # Player 5 branch changes
 
 This branch replaces Player 5's parallel depth-first enumeration with a

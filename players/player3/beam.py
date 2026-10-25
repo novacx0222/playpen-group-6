@@ -78,6 +78,7 @@ def face_beam(
     starts=None,
     boundary_guided=False,
     compactness=1.0,
+    expansions_per_start=128,
 ):
     """Search inside the room, checking exact one/two-face closures throughout.
 
@@ -118,17 +119,13 @@ def face_beam(
     incumbent = 0.0
     if starts is None:
         starts = search_starts(room, min(lengths), max_starts=36, deadline=deadline)
-    # Give every location a bounded share. A difficult first start cannot
-    # consume the entire global budget before edge/interior alternatives run.
-    for start_index, (start, angle) in enumerate(starts):
-        now = time.process_time()
-        if now >= deadline:
+    # Fixed expansion counts make branch selection independent of CPU speed.
+    # Only the overall deadline can interrupt this deterministic search prefix.
+    for start, angle in starts:
+        if time.process_time() >= deadline:
             break
         stats["starts"] += 1
-        remaining_starts = len(starts) - start_index
-        local_deadline = min(
-            deadline, now + max(0.12, (deadline - now) / remaining_starts)
-        )
+        start_expanded = 0
         directions = tuple(
             (
                 math.cos(math.radians(angle + 45 * i)),
@@ -166,9 +163,7 @@ def face_beam(
                     score if closure_best is None else max(closure_best, score)
                 )
 
-        def close(
-            state, start=start, directions=directions, local_deadline=local_deadline
-        ):
+        def close(state, start=start, directions=directions, deadline=deadline):
             """Solve for remaining lengths rather than enumerate every piece."""
             count = len(state.lengths)
             end = state.points[-1]
@@ -222,7 +217,7 @@ def face_beam(
                         continue
                     middle = (end[0] + a * u[0], end[1] + a * u[1])
                     record(state.points + (middle,))
-                    if time.process_time() >= local_deadline:
+                    if time.process_time() >= deadline:
                         return
 
         beam = []
@@ -252,10 +247,17 @@ def face_beam(
                     )
                 )
         for _depth in range(1, max_faces):
-            if not beam or time.process_time() >= local_deadline:
+            if (
+                not beam
+                or start_expanded >= expansions_per_start
+                or time.process_time() >= deadline
+            ):
                 break
             children = {}
             for state in beam:
+                if start_expanded >= expansions_per_start:
+                    break
+                start_expanded += 1
                 stats["expanded"] += 1
                 stats["deepest"] = max(stats["deepest"], len(state.lengths))
                 if not catalog.feasible_prefix(state.lengths):
@@ -264,7 +266,7 @@ def face_beam(
                 closure_best = None
                 if len(state.lengths) >= 2:
                     close(state)
-                if time.process_time() >= local_deadline:
+                if time.process_time() >= deadline:
                     break
                 # For any completion, area <= room area and <= P^2/(4*pi).
                 # With C<0, even an optimistic completion must pay for the
@@ -326,7 +328,7 @@ def face_beam(
                                 or abs(8 - total_turn)
                                 > 2 * (right_max - r) + diagonal_max - d
                                 or not catalog.can_reserve_return(
-                                    prefix, distance, return_faces, local_deadline
+                                    prefix, distance, return_faces, deadline
                                 )
                             ):
                                 stats["return_prunes"] += 1
@@ -376,12 +378,12 @@ def face_beam(
                             children[key] = (rank, child)
                         if (
                             stats["states"] % 128 == 0
-                            and time.process_time() >= local_deadline
+                            and time.process_time() >= deadline
                         ):
                             break
-                    if time.process_time() >= local_deadline:
+                    if time.process_time() >= deadline:
                         break
-                if time.process_time() >= local_deadline:
+                if time.process_time() >= deadline:
                     break
             # Keep heading/position diversity so a single long-side family
             # does not consume every beam slot and suppress useful turns.

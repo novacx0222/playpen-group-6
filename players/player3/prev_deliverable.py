@@ -17,10 +17,10 @@ from .placement import rectangle_seeds
 
 
 class Player3(Player):
-    # Compatible with the submission checker's 60 CPU-second default, even
-    # though the simulator's separately configurable default is 300 seconds.
-    SEARCH_SECONDS = 55.0
-    RECTANGLE_SECONDS = 5.0
+    # One CPU deadline shared by seeding, beam search, and mapped growth.
+    SEARCH_SECONDS = 250.0
+    RECTANGLE_CANDIDATES = 2000
+    EXPANSIONS_PER_START = 128
     BEAM_WIDTH = 24
     MAX_FACES = 14
     USE_BEAM = True
@@ -41,7 +41,7 @@ class Player3(Player):
 
     def build_enclosure(self):
         begun = time.process_time()
-        deadline = begun + self.SEARCH_SECONDS
+        deadline = getattr(self, "SEARCH_DEADLINE", begun + self.SEARCH_SECONDS)
         self.search_stats = {"candidates": 0, "valid_candidates": 0, "improvements": 0}
         self.progress = []
         if not self.inventory.has_gate() or self.inventory.count_connectors() < 3:
@@ -60,11 +60,10 @@ class Player3(Player):
         best, best_score = None, 0.0
         seen = {}
         stage = "rectangle"
-        stage_deadline = min(deadline, time.process_time() + self.RECTANGLE_SECONDS)
 
         def consider(vertices):
             nonlocal best, best_score
-            if time.process_time() >= stage_deadline:
+            if time.process_time() >= deadline:
                 return None
             key = tuple((round(x, 6), round(y, 6)) for x, y in vertices)
             if key in seen:
@@ -78,10 +77,10 @@ class Player3(Player):
                 seen[key] = None
                 return None
             construction = catalog.build(
-                vertices, prefer_bonus=self.weights.G > 0, deadline=stage_deadline
+                vertices, prefer_bonus=self.weights.G > 0, deadline=deadline
             )
             if construction is None:
-                if time.process_time() < stage_deadline:
+                if time.process_time() < deadline:
                     seen[key] = None
                 return None
             result = validate_construction(construction, self.room, self.inventory)
@@ -104,8 +103,9 @@ class Player3(Player):
                 self.room,
                 catalog,
                 self.weights,
-                stage_deadline,
+                deadline,
                 consider,
+                max_candidates=self.RECTANGLE_CANDIDATES,
             )
         )
         if self.USE_BEAM:
@@ -123,9 +123,6 @@ class Player3(Player):
                 beam_width=beam_width,
                 max_faces=max_faces,
             )
-            reserve = min(5.0, self.SEARCH_SECONDS * 0.15) if best is None else 0.25
-            beam_deadline = deadline - reserve
-            stage_deadline = beam_deadline
             # Narrowing the first beam can permanently discard useful paths.
             # Preserve the original search first, then spend unused time on
             # the room-guided alternative, sharing the validated incumbent.
@@ -134,7 +131,7 @@ class Player3(Player):
                 passes.append(("adaptive", beam_width, max_faces))
             self.search_stats["beam_passes"] = []
             for name, width, faces in passes:
-                if time.process_time() >= beam_deadline:
+                if time.process_time() >= deadline:
                     break
                 stage = f"beam_{name}"
                 pass_stats = face_beam(
@@ -142,10 +139,11 @@ class Player3(Player):
                     self.inventory,
                     catalog,
                     self.weights,
-                    beam_deadline,
+                    deadline,
                     consider,
                     beam_width=width,
                     max_faces=faces,
+                    expansions_per_start=self.EXPANSIONS_PER_START,
                 )
                 self.search_stats["beam_passes"].append(
                     {
@@ -158,11 +156,11 @@ class Player3(Player):
                 )
                 for key, value in pass_stats.items():
                     self.search_stats[key] = self.search_stats.get(key, 0) + value
-        if best is None and deadline - time.process_time() > 0.1:
+        if best is None and time.process_time() < deadline:
             from .legacy import Player3 as LegacyPlayer
 
             fallback = LegacyPlayer(self.room, self.inventory, self.weights)
-            fallback.SEARCH_SECONDS = max(0.01, deadline - time.process_time() - 0.1)
+            fallback.SEARCH_DEADLINE = deadline
             construction = fallback.build_enclosure()
             if construction is not None:
                 result = validate_construction(construction, self.room, self.inventory)

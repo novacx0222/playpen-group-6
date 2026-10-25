@@ -21,9 +21,7 @@ class SegmentedRectangleTests(unittest.TestCase):
         self.assertAlmostEqual(polygon.length, shape.perimeter)
         self.assertAlmostEqual(
             shape.area,
-            (30 + 20 + 25 + math.sqrt(2.0) * 5) * 8
-            - math.sqrt(2.0) * 20 * 5
-            - 25,
+            (30 + 20 + 25 + math.sqrt(2.0) * 5) * 8 - math.sqrt(2.0) * 20 * 5 - 25,
         )
 
     def test_segmented_rectangle_obeys_face_limit(self):
@@ -62,6 +60,7 @@ class DenseRasterTests(unittest.TestCase):
 
         self.assertTrue(curved._small_stock_search_worthwhile())
 
+
 class PartialSupplyTests(unittest.TestCase):
     def test_partial_face_filter_does_not_require_a_gate_yet(self):
         scenario = read_scenario("scenarios/players/player8/curved.json")
@@ -87,7 +86,10 @@ class PartialSupplyTests(unittest.TestCase):
         base = Walk(((0.0, 0.0),), 0, 0, (0, 0, 0, 0), (), (), 0, 0)
         candidates = [
             (100.0, base.__class__(base.points, 0, 0, base.lattice, (24,), (), 0, 0)),
-            (90.0, base.__class__(base.points, 0, 0, base.lattice, (8, 8, 8), (), 0, 2)),
+            (
+                90.0,
+                base.__class__(base.points, 0, 0, base.lattice, (8, 8, 8), (), 0, 2),
+            ),
         ]
 
         selected = walker._select(candidates, 2)

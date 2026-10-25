@@ -1,5 +1,3 @@
-"""Four interleaved, closed growth fronts sharing one physical inventory."""
-
 import math
 import time
 from dataclasses import dataclass, field
@@ -13,6 +11,7 @@ from shapely.prepared import prep
 from src.constants import TOL
 from src.enclosure import score_construction, validate_construction
 
+from .passages import passage_patches
 from .room_map import RoomMap
 
 
@@ -187,31 +186,22 @@ def grow_enclosure(
     use_map=True,
     beam_width=3,
 ):
-    """Round-robin growth, merge on contact outside the common seed.
-
-    All current fronts' union must fit a single inventory before committing a
-    move. Removed internal walls can be reused. Unmerged fronts are alternative
-    finished enclosures; return the highest-scoring validated enclosure found.
-    """
     seed_result = validate_construction(initial, room, inventory)
     seed = seed_result.polygon
     faces = starting_faces(seed, room.polygon, deadline)
     room_map = None
     route_choices = []
     if use_map and time.process_time() < deadline:
-        now = time.process_time()
         room_map = RoomMap(
             room.polygon,
             min(catalog.lengths),
-            min(deadline, now + min(1.2, (deadline - now) * 0.12)),
+            deadline,
         )
         points = face_vertices(seed)
         candidates = faces + [
             face for face in pairwise(points + points[:1]) if face not in faces
         ]
-        routes = room_map.routes(
-            seed, candidates, deadline=min(deadline, time.process_time() + 0.5)
-        )
+        routes = room_map.routes(seed, candidates, deadline=deadline)
         claimed, selected = set(), set()
         while routes and len(route_choices) < 4:
             route = max(
@@ -250,10 +240,46 @@ def grow_enclosure(
         "map_routes_selected": len(route_choices),
         "lookahead_expanded": 0,
         "lookahead_turns": 0,
+        "route_guided_proposals": 0,
+        "route_guided_extensions": 0,
+        "lookahead_depth": 1,
         "route_targets": [route.target for route in route_choices],
     }
     cache = {}
     prepared_room = prep(room.polygon.buffer(TOL))
+    guided_keys = set()
+
+    def growth_proposals(front, polygon, face, until):
+        seen = set()
+        families = [
+            (
+                True,
+                iter(
+                    passage_patches(
+                        polygon, face, catalog.lengths, front.route, room.polygon, until
+                    )
+                ),
+            ),
+            (False, iter(growth_patches(polygon, [face], catalog.lengths))),
+        ]
+        # Do not let detailed passage alignment crowd out broad ordinary moves.
+        while families:
+            remaining = []
+            for guided, iterator in families:
+                patch = next(iterator, None)
+                if patch is None:
+                    continue
+                remaining.append((guided, iterator))
+                key = patch.normalize().wkb
+                if key in seen:
+                    continue
+                seen.add(key)
+                if guided:
+                    guided_keys.add(key)
+                    stats["route_guided_proposals"] += 1
+                yield patch
+            families = remaining
+
     best_finished = [score_construction(seed_result, weights), seed.area, initial]
 
     def pack(polygon):
@@ -288,8 +314,7 @@ def grow_enclosure(
         shared = unary_union(
             [candidate] + [f.polygon for f in fronts if f is not front]
         )
-        if pack(shared) is None:
-            return None
+        pack(shared)
         return construction
 
     def rank(front, candidate):
@@ -298,11 +323,11 @@ def grow_enclosure(
         )
         return candidate.area + 0.5 * future
 
-    def lookahead(front, beam, local_deadline):
+    def lookahead_layer(front, beam, deadline):
         """A second beam layer may continue forward or turn onto adjacent faces."""
         expanded = list(beam)
         for parent in beam:
-            if time.process_time() >= local_deadline:
+            if time.process_time() >= deadline:
                 break
             _, polygon, _, patch, previous = parent
             active = outer_face(polygon, patch, previous)
@@ -323,12 +348,12 @@ def grow_enclosure(
                     )
                 )
             iterators = [
-                (face, iter(growth_patches(polygon, [face], catalog.lengths)))
+                (face, iter(growth_proposals(front, polygon, face, deadline)))
                 for face in adjacent[:3]
             ]
             for _ in range(32):
                 for face, proposals in iterators:
-                    if time.process_time() >= local_deadline:
+                    if time.process_time() >= deadline:
                         return sorted(expanded, key=lambda item: item[0], reverse=True)[
                             :beam_width
                         ]
@@ -357,6 +382,20 @@ def grow_enclosure(
                         stats["lookahead_turns"] += 1
         expanded.sort(key=lambda item: item[0], reverse=True)
         return expanded[:beam_width]
+
+    def lookahead(front, beam, deadline):
+        # A narrow entrance may need an approach, a neck, and a turn before
+        # opening out into the next region. Keep valid alternatives throughout.
+        layers = (
+            3 if any(item[3].normalize().wkb in guided_keys for item in beam) else 1
+        )
+        for layer in range(layers):
+            now = time.process_time()
+            if now >= deadline:
+                break
+            beam = lookahead_layer(front, beam, deadline)
+            stats["lookahead_depth"] = max(stats["lookahead_depth"], layer + 2)
+        return beam
 
     while fronts and time.process_time() < deadline:
         stats["rounds"] += 1
@@ -399,7 +438,7 @@ def grow_enclosure(
                             front.polygon,
                             available[:12],
                             claimed,
-                            deadline=min(deadline, time.process_time() + 0.15),
+                            deadline=deadline,
                         )
                         if routes:
                             front.route = routes[0]
@@ -419,14 +458,13 @@ def grow_enclosure(
                         }
                     )
                 front.pending = iter(
-                    growth_patches(front.polygon, [front.active_face], catalog.lengths)
+                    growth_proposals(front, front.polygon, front.active_face, deadline)
                 )
             best = None
             beam = []
             selected_face = front.active_face
-            local_deadline = min(deadline, time.process_time() + 0.2)
             for _ in range(batch):
-                if time.process_time() >= local_deadline:
+                if time.process_time() >= deadline:
                     break
                 patch = next(front.pending, None)
                 if patch is None:
@@ -459,12 +497,16 @@ def grow_enclosure(
             if beam:
                 if use_map:
                     beam = lookahead(
-                        front, beam, min(deadline, time.process_time() + 0.08)
+                        front,
+                        beam,
+                        deadline,
                     )
                 best = beam[0]
             if best is None:
                 continue
             _, front.polygon, front.construction, patch, previous_face = best
+            if patch.normalize().wkb in guided_keys:
+                stats["route_guided_extensions"] += 1
             front.active_face = outer_face(front.polygon, patch, previous_face)
             front.pending, front.exhausted = None, False
             stats["growth_steps"] += 1

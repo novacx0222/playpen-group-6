@@ -40,6 +40,9 @@ class Walk:
     turns: tuple  # turns[i] = corner at the start of face i (turns[0] set on closing)
     rights: int
     diagonals: int
+    # kept as the walk grows, so ranking a walk needs no pass over all its corners
+    twice: float = 0.0  # twice the shoelace area of the path so far
+    length: int = 0  # total length of its faces
 
 
 def _step(h: int, length: int) -> list[int]:
@@ -78,12 +81,9 @@ class Walker:
 
     def _value(self, w: Walk) -> float:
         """Score if the walk were closed by a straight chord: what the beam ranks by."""
-        p = np.array(w.points)
-        area = 0.5 * abs(
-            np.dot(p[:, 0], np.roll(p[:, 1], -1))
-            - np.dot(p[:, 1], np.roll(p[:, 0], -1))
-        )
-        perimeter = sum(w.faces) + math.dist(w.points[-1], w.points[0])
+        (x0, y0), (x1, y1) = w.points[0], w.points[-1]
+        area = 0.5 * abs(w.twice + x1 * y0 - x0 * y1)
+        perimeter = w.length + math.dist(w.points[-1], w.points[0])
         return self.A * area + self.C * perimeter
 
     # ---------------------------------------------------------- expansion
@@ -133,6 +133,8 @@ class Walker:
                             w.turns + (turn,),
                             rights,
                             diagonals,
+                            w.twice + x * float(end[1]) - float(end[0]) * y,
+                            w.length + L,
                         )
                     )
         return out
@@ -207,8 +209,7 @@ class Walker:
         """
         if not self.diverse:
             return [
-                w
-                for _, w in heapq.nlargest(width, scored, key=lambda item: item[0])
+                w for _, w in heapq.nlargest(width, scored, key=lambda item: item[0])
             ]
         buckets: dict[tuple[int, int, int], list[tuple[float, Walk]]] = {}
         for value, walk in scored:

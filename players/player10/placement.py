@@ -77,6 +77,17 @@ class RoomSearch:
         self._frames: dict[float, tuple] = {}
         self._bases: dict[int, list[float]] = {}
 
+    def main_direction(self) -> float:
+        """The room's average wall direction, modulo 90 degrees: each wall's angle
+        counted four times round and weighted by its length, so walls at right
+        angles agree instead of cancelling."""
+        points = np.vstack([self.corners, self.corners[:1]])
+        d = np.diff(points, axis=0)
+        lengths = np.hypot(d[:, 0], d[:, 1])
+        angles = np.arctan2(d[:, 1], d[:, 0])
+        mean = np.sum(lengths * np.exp(4j * angles))
+        return float(np.degrees(np.angle(mean) / 4.0) % 90.0)
+
     def base_headings(self, step: int) -> list[float]:
         """The directions of the room's longest edges, modulo `step` degrees."""
         if step not in self._bases:
@@ -102,11 +113,8 @@ class RoomSearch:
         return self._bases[step]
 
     def headings(self, step: int, symmetry: int) -> list[float]:
-        return [
-            base + turn
-            for base in self.base_headings(step)
-            for turn in range(0, symmetry, step)
-        ]
+        bases = self.base_headings(step)
+        return [base + turn for base in bases for turn in range(0, symmetry, step)]
 
     def _frame(self, heading: float) -> tuple:
         """The room as seen from a frame turned by `heading`, in which the shape
@@ -248,11 +256,13 @@ class RoomSearch:
         step: int,
         symmetry: int,
         limit: int = 3,
+        only: list[float] | None = None,
     ) -> list[tuple[tuple[float, float], float]]:
         """Up to `limit` (start, heading) pairs at which the shape fits. `step` and
-        `symmetry` say which headings are worth trying (see `headings`)."""
+        `symmetry` say which headings are worth trying (see `headings`); `only`
+        replaces them with a list of its own."""
         local = np.array(vertices, dtype=float)
-        headings = self.headings(step, symmetry)
+        headings = only if only is not None else self.headings(step, symmetry)
         found: list[tuple[tuple[float, float], float]] = []
         for candidates in (self._anchor_offsets, self._contact_offsets):
             for heading in headings:

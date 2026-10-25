@@ -116,8 +116,8 @@ def search_starts(room, minimum_length, max_starts=40, deadline=None):
     return starts
 
 
-def rectangle_seeds(room, catalog, weights, deadline, consider):
-    """Try high-scoring, contained rectangles until a CPU deadline.
+def rectangle_seeds(room, catalog, weights, deadline, consider, *, max_candidates=2000):
+    """Try a fixed number of rectangles, subject to the global CPU deadline.
 
     ``catalog.lengths`` gives individually attainable face lengths.  ``consider``
     must assign pieces jointly to all four faces and validate the construction;
@@ -267,6 +267,8 @@ def rectangle_seeds(room, catalog, weights, deadline, consider):
                 key = tuple(sorted((round(x, 7), round(y, 7)) for x, y in points))
                 if key in tried:
                     continue
+                if stats["rectangles_tested"] >= max_candidates:
+                    return finish()
                 tried.add(key)
                 stats["rectangles_tested"] += 1
                 if not tolerant.covers(Polygon(points)):

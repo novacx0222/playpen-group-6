@@ -45,6 +45,7 @@ RESULT_TAG = "result"
 TOOLTIP_TAG = "tooltip"
 
 PANEL_MARGIN = 20  # left/right padding inside the info panel, in pixels
+SCROLLBAR_SPACE = 16  # width reserved for the panel's scrollbar, in pixels
 
 
 def _signed(x: float) -> str:
@@ -132,12 +133,12 @@ class Game:
     # ------------------------------------------------------------------ gui
 
     def _info_width(self) -> int:
-        return int(c.CANVAS_WIDTH * c.INFO_PORTION)
+        return int(c.CANVAS_WIDTH * c.INFO_PORTION) + SCROLLBAR_SPACE
 
     def _panel_width(self) -> float:
         """Width available to text inside the info panel: its width, minus the
         10px padding on each side of the canvas and our own margins."""
-        return self._info_width() - 20 - 2 * PANEL_MARGIN
+        return self._info_width() - SCROLLBAR_SPACE - 20 - 2 * PANEL_MARGIN
 
     def _build_gui(self):
         self.root = tk.Tk()
@@ -152,17 +153,28 @@ class Game:
         self.right_frame.pack(side="right", fill="y")
         self.right_frame.pack_propagate(False)
 
+        self.panel_scrollbar = tk.Scrollbar(self.right_frame, orient="vertical")
+        self.panel_scrollbar.pack(side="right", fill="y", pady=10)
         self.info = tk.Canvas(
-            self.right_frame, bg=c.INFO_BG, highlightthickness=0, yscrollincrement=20
+            self.right_frame,
+            bg=c.INFO_BG,
+            highlightthickness=0,
+            yscrollincrement=20,
+            yscrollcommand=self.panel_scrollbar.set,
         )
-        self.info.pack(fill="both", expand=True, padx=10, pady=10)
+        self.panel_scrollbar.configure(command=self.info.yview)
+        self.info.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=10)
         # If the window is too short for everything in the panel (a small
         # screen), the panel scrolls with the mouse wheel rather than cutting
         # content off.
         self.info.bind("<Configure>", lambda _event: self._update_panel_scroll())
-        self.info.bind("<MouseWheel>", self._on_panel_wheel)
-        self.info.bind("<Button-4>", lambda _event: self.info.yview_scroll(-1, "units"))
-        self.info.bind("<Button-5>", lambda _event: self.info.yview_scroll(1, "units"))
+        # Bound on the whole app (not just the canvas) so the wheel works with
+        # the pointer anywhere over the panel -- on the button, say. The
+        # handler ignores the room view and the inventory box, which scrolls
+        # itself.
+        self.root.bind_all("<MouseWheel>", self._on_panel_wheel)
+        self.root.bind_all("<Button-4>", self._on_panel_wheel)
+        self.root.bind_all("<Button-5>", self._on_panel_wheel)
 
         self.canvas = tk.Canvas(
             self.root,
@@ -504,6 +516,9 @@ class Game:
         view_w, view_h = self._canvas_size()
         left = px + 14 if px + 14 + box_w <= view_w else px - 14 - box_w
         top = py + 14 if py + 14 + box_h <= view_h else py - 14 - box_h
+        # flipping isn't enough in a very narrow view: keep the box on screen
+        left = max(2, min(left, view_w - box_w - 2))
+        top = max(2, min(top, view_h - box_h - 2))
         box = self.canvas.create_rectangle(
             left,
             top,
@@ -694,10 +709,23 @@ class Game:
             self.info.yview_moveto(0)
 
     def _on_panel_wheel(self, event):
+        widget = str(getattr(event, "widget", self.info))
+        if not widget.startswith(str(self.right_frame)):
+            return  # over the room view
+        if self.inventory_box is not None and widget.startswith(
+            str(self.inventory_box.master)
+        ):
+            return  # the inventory box scrolls itself
         if self.info.yview() == (0.0, 1.0):
             return  # everything fits: nothing to scroll
-        # macOS reports small deltas, Windows multiples of 120
-        units = -event.delta // 120 if abs(event.delta) >= 120 else -event.delta
+        num = getattr(event, "num", None)
+        if num == 4:  # X11: the wheel is buttons 4 and 5
+            units = -1
+        elif num == 5:
+            units = 1
+        else:
+            # macOS reports small deltas, Windows multiples of 120
+            units = -event.delta // 120 if abs(event.delta) >= 120 else -event.delta
         self.info.yview_scroll(int(units), "units")
 
     def _build_inventory_box(self, y: float) -> float:

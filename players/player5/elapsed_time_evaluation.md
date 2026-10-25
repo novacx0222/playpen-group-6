@@ -1,3 +1,5 @@
+> Archived: this document describes a previous implementation. See [README.md](README.md) for the current strategy and benchmark procedure.
+
 # Five-second elapsed-time evaluation
 
 These measurements used the scenario snapshot on `naive-exhaustive-search`,
@@ -67,10 +69,11 @@ Combined CPU is measured from parent process CPU plus OS-reported CPU for comple
 | scenarios/players/player9/hallways.json | valid | 8390.00 | False | 5.033 |
 | scenarios/players/player9/lollipop_trap.json | valid | 2894.00 | False | 5.031 |
 
-## Running the current benchmark
+## Historical commands
 
-These commands run the current upstream scenarios and the two remaining
-comparison scenarios, respectively; they do not recreate the historical snapshot.
+These commands describe the older elapsed-time implementation. Their
+`--time-limit` option is not accepted by the current benchmark. See
+[README.md](README.md) for current CPU-budget commands.
 
 ```sh
 uv run python -m players.player5.benchmark --workers 4 --time-limit 5 --output logs/player5-wall-4-workers.json

@@ -1,8 +1,8 @@
 # WINDOW -- CANVAS_WIDTH/HEIGHT are the *preferred* window size; the window is
 # shrunk to fit the screen (minus the padding below for menu bar, title bar,
 # Dock), and everything is laid out from the size the window actually ends up
-CANVAS_WIDTH = 1300
-CANVAS_HEIGHT = 900
+CANVAS_WIDTH = 1500
+CANVAS_HEIGHT = 1000
 ROOM_PORTION = 2 / 3
 INFO_PORTION = 1 - ROOM_PORTION
 SCREEN_PADDING_X = 40

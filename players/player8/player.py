@@ -1,10 +1,12 @@
 """Group 8 player.
 
-Tries a lot of candidate shapes (rectangles, cut-corner octagons and hexagons,
-L/U/T shapes, and grid-traced outlines for big rooms), builds every side out of
-real inventory pieces, fits the shape into the room and keeps the best valid
-one. Every candidate is checked with the simulator's own validator, so we only
-ever return something valid (or None).
+Tries a lot of candidate shapes (grid-traced outlines for big rooms,
+rectangles, cut-corner octagons and hexagons, L/U/T shapes, and everything
+right-angled grown by bumps), builds every side out of real inventory pieces,
+fits the shape into the room and keeps the best valid one. Every candidate is
+checked with the simulator's own validator, so we only ever return something
+valid (or None). Phases are bounded by work, not by the clock, so the result
+does not depend on how fast the machine is.
 """
 
 import bisect
@@ -13,7 +15,9 @@ import math
 import random
 import time
 
-from shapely.geometry import Polygon
+import numpy as np
+import shapely
+from shapely.geometry import Point, Polygon
 
 from players.player0 import Player
 from src.constants import MIN_WALL_LENGTH, TOL
@@ -25,15 +29,44 @@ try:  # a prepared polygon makes the repeated containment tests a lot faster
 except ImportError:
     prep = None
 
-# CPU seconds we give ourselves. The limit is 300, but the submission checker
-# runs with 60, so stay well below that.
-TIME_BUDGET = 50.0
-TEMPLATE_SHARE = 0.4  # first pass over the templates
-GRID_SHARE = 0.7  # grid outlines
-RESUME_SHARE = 0.85  # leftover templates, then random restarts until the end
+# CPU seconds we give ourselves. The simulator's limit is 300 (the submission
+# checker's 60 s smoke runs only report a timeout as a warning). Every phase is
+# bounded by work, not by the clock, so the same input gives the same answer on
+# any machine; the deadline is a safety net for machines far slower than ours.
+TIME_BUDGET = 290.0
+TEMPLATE_CHECKS = 5_000_000  # containment checks per template pass (two passes)
+MAX_GRIDS = 150  # grids the outline phase may try (it normally finishes them all)
+MAX_REFINE_SEEDS = (
+    24  # root shapes grown by bumps, best first (the spiral needs its fifth)
+)
+POSE_SEEDS = 8  # best rectangles also grown from other places they fit ...
+POSES_PER_SEED = 20  # ... this many places each
+DOMINANCE_OK = {
+    "rect",
+    "oct",
+    "hex",
+    "L",
+    "T",
+    "stair",
+    "stair2",
+}  # larger parameters contain the smaller shape
+# Random restarts keep paying off late (improvements measured at restart
+# 20,000+ on some rooms), so the caps are generous; on this machine a room
+# of restarts runs at 200-400 per second.
+MAX_RESTARTS = 80_000  # random restarts in total ...
+IDLE_RESTARTS = 20_000  # ... and consecutive restarts without an improvement
 
-N_SEEDS = 4  # shapes we try to grow by bumps
+# Exact placement (Placer.exact_place): an angle is tested exactly when the room
+# has few enough walls for it to be cheap; each test is charged this many
+# containment checks against the template budget.
+EXACT_LIMIT = 1000  # room walls x shape sides
+EXACT_MAX_ANGLES = 32  # rotations tested exactly per shape (longest walls first)
+EXACT_FAST_CHECKS = 1500  # anchored poses tried before the exact pass
+EXACT_COST = 25  # containment checks charged per room edge of an exact fit test
 MAX_FAILED_MEMO = 400
+# families walked after all the others (their own best-first segment), so a
+# large new family can never starve the proven ones of the template budget
+LATE_FAMILIES = {"stair", "stair2"}
 MAX_PARTS = 6  # pieces on one face: 30 / 5
 NODE_LIMIT = 4000  # backtracking budget for one allocation
 RELAX_MAX_SIDES = 24  # the cheap feasibility check is only trusted up to this
@@ -138,6 +171,17 @@ class Shape:
     def valid(self):
         return self.turns_ok and self.closes and self.area > 0
 
+    def symmetry(self):
+        """The smallest rotation (90, 180 or 360 degrees) that maps the shape
+        onto itself; rotations that differ by it give the same placements."""
+        seq = list(zip(self.dirs, self.lengths))
+        n = len(seq)
+        for step, deg in ((2, 90), (4, 180)):
+            rot = [((d + step) % 8, length) for d, length in seq]
+            if any(rot[k:] + rot[:k] == seq for k in range(n)):
+                return deg
+        return 360
+
     def interior_angle(self, i):
         return 180.0 - 45.0 * TURN_SIGNED[self.turns[i]]
 
@@ -213,6 +257,72 @@ def t_shape(a1, a2, a3, b1, b2):
     )
 
 
+def z_shape(a, b, c, d):
+    """Two a by b rectangles, the upper one shifted left by c and up by d (a Z).
+    Needs c < a and d < b so that they overlap."""
+    return Shape("Z", (a, b, c, d), [0, 2, 4, 2, 4, 6, 0, 6], [a, b, c, d, a, b, c, d])
+
+
+def step_shape(a, b, c, d):
+    """A thin snake: a bar a long and d thick, a bar b high and c thick hanging
+    from its right end, and the same again rotated by 180 degrees, so that it
+    threads corridors narrower than any rectangle that pays. Needs c < a and
+    d < b."""
+    return Shape(
+        "step", (a, b, c, d), [0, 2, 4, 6, 4, 6, 0, 2], [a, b, c, d, a, b, c, d]
+    )
+
+
+def stair(p, q, c, s):
+    """A p-wide block with its top-right corner cut by a diagonal c and its
+    bottom-left corner cut by a diagonal c followed by a straight s: the two
+    steps hug a wall that is steeper than 45 degrees (3 right and 4 diagonal
+    connectors, one of them reflex)."""
+    return Shape(
+        "stair", (p, q, c, s), [4, 6, 7, 6, 0, 2, 3], [p, q, c, s, p, q + s, c]
+    )
+
+
+def stair2(p, q, c, s):
+    """The mirror image of `stair` (the placer rotates but never mirrors)."""
+    return Shape(
+        "stair2", (p, q, c, s), [5, 6, 0, 2, 1, 2, 4], [c, q + s, p, s, c, q, p]
+    )
+
+
+def band(s, k, d, h):
+    """A strip h high whose two long sides are k+1 runs of s separated by k
+    inward V-dips with legs d (two diagonal connectors and one reflex right
+    connector each): how a face longer than 30 is broken in a thin room."""
+    dirs = [0, 1, 7] * k + [0, 2] + [4, 5, 3] * k + [4, 6]
+    lengths = [s, d, d] * k + [s, h] + [s, d, d] * k + [s, h]
+    return Shape("band", (s, k, d, h), dirs, lengths)
+
+
+def band2(s1, s2, k, d, h):
+    """A band whose runs are s1 and s2 (k = 1) or s1, s2, s1 (k = 2): the
+    middle run is often the one that has to be a different length."""
+    runs = [s1, s2] if k == 1 else [s1, s2, s1]
+    dirs, lengths = [], []
+    for j, r in enumerate(runs):
+        if j:
+            dirs += [1, 7]
+            lengths += [d, d]
+        dirs.append(0)
+        lengths.append(r)
+    dirs.append(2)
+    lengths.append(h)
+    for j, r in enumerate(reversed(runs)):
+        if j:
+            dirs += [5, 3]
+            lengths += [d, d]
+        dirs.append(4)
+        lengths.append(r)
+    dirs.append(6)
+    lengths.append(h)
+    return Shape("band2", (s1, s2, k, d, h), dirs, lengths)
+
+
 TEMPLATES = {
     "rect": rectangle,
     "oct": octagon,
@@ -221,6 +331,12 @@ TEMPLATES = {
     "L": l_shape,
     "U": u_shape,
     "T": t_shape,
+    "Z": z_shape,
+    "step": step_shape,
+    "band": band,
+    "band2": band2,
+    "stair": stair,
+    "stair2": stair2,
 }
 
 # --- piece allocation ---------------------------------------------------------
@@ -510,6 +626,23 @@ class Placer:
         padded = room.polygon.buffer(TOL)
         self.checker = prep(padded) if prep is not None else padded
         self.max_radius = self._max_radius()
+        self.checks = 0  # containment tests so far: the template walk's unit of work
+        self.diameter = max(
+            math.hypot(a[0] - b[0], a[1] - b[1]) for a in pts for b in pts
+        )
+        # the walls' directions modulo 45 degrees (clustered to 0.05), longest
+        # walls first: a shape side parallel to a wall is where tight fits are
+        weight = {}
+        for ang, length in zip(self.out_angle, self.edge_len):
+            base = round((ang % 45.0) / 0.05) * 0.05
+            if base >= 45.0 - 1e-9:
+                base = 0.0
+            weight[base] = weight.get(base, 0.0) + length
+        self.wall_bases = [b for b, _ in sorted(weight.items(), key=lambda t: -t[1])]
+        self._extents = {}  # direction -> the room's extent along it
+        self._pts_arr = np.asarray(pts, dtype=float)
+        self._edge_a = self._pts_arr
+        self._edge_b = np.roll(self._pts_arr, -1, axis=0)
 
     def _max_radius(self):
         """Upper bound on the largest circle that fits in the room (sampled on a
@@ -533,6 +666,7 @@ class Placer:
         )
 
     def fits(self, world):
+        self.checks += 1
         minx, miny, maxx, maxy = self.bounds
         for x, y in world:
             if not (
@@ -544,7 +678,15 @@ class Placer:
         return self.checker.contains(Polygon(world))
 
     def candidates(self, shape, step45):
-        """(theta, tx, ty) placements to try, best guesses first."""
+        """(theta, tx, ty) placements to try, best guesses first: the anchored
+        poses, then the coarse sweep."""
+        yield from self._anchored(shape)
+        yield from self._sweep(shape, step45)
+
+    def _anchored(self, shape):
+        """Poses with a shape corner in a room corner (a side along either
+        wall), then a convex shape corner sliding along every wall, longest
+        walls first. Cheap, and where most placements are."""
         n = len(shape.vertices)
         shape_out = [45.0 * d for d in shape.dirs]
         shape_in = [shape_out[i - 1] for i in range(n)]
@@ -555,8 +697,6 @@ class Placer:
                 if gap >= -1e-6:
                     pairs.append((gap, j, i))
         pairs.sort()
-
-        # corner into corner, shape side along either wall at that corner
         for _, j, i in pairs:
             rx, ry = self.pts[j]
             vx, vy = shape.vertices[i]
@@ -566,20 +706,18 @@ class Placer:
             ):
                 x, y = _rot(vx, vy, theta)
                 yield theta, rx - x, ry - y
-
-        # then slide along the wall that leaves the room corner
-        for _, j, i in pairs:
+        convex = [i for i in range(n) if shape.interior_angle(i) < 180.0]
+        for j in sorted(range(len(self.pts)), key=lambda j: -self.edge_len[j]):
             rx, ry = self.pts[j]
-            vx, vy = shape.vertices[i]
-            theta = self.out_angle[j] - shape_out[i]
-            x, y = _rot(vx, vy, theta)
             ex, ey = _rot(1.0, 0.0, self.out_angle[j])
-            for frac in (0.5, 0.25, 0.75, 1.0):
-                d = (self.edge_len[j] - shape.lengths[i]) * frac
-                if d > 1e-6:
-                    yield theta, rx + ex * d - x, ry + ey * d - y
-
-        yield from self._sweep(shape, step45)
+            for i in convex:
+                theta = self.out_angle[j] - shape_out[i]
+                x, y = _rot(shape.vertices[i][0], shape.vertices[i][1], theta)
+                free = self.edge_len[j] - shape.lengths[i]
+                for frac in (0.5, 0.25, 0.75, 1.0):
+                    d = free * frac
+                    if abs(d) > 1e-6:
+                        yield theta, rx + ex * d - x, ry + ey * d - y
 
     def _sweep(self, shape, step45):
         """Last resort: centre the shape on interior points at room-aligned
@@ -611,10 +749,144 @@ class Placer:
                 x, y = _rot(cx, cy, theta)
                 yield theta, px - x, py - y
 
+    def angle_set(self, shape):
+        """Rotations worth an exact test: a side of the shape parallel to a
+        wall of the room (longest walls first), kept only when the shape's
+        extent fits the room's extent along the frame's four directions."""
+        out = []
+        turns = {90: 2, 180: 4, 360: 8}[shape.symmetry()]
+        for base in self.wall_bases:
+            for k in range(turns):
+                theta = (base + 45.0 * k) % 360.0
+                pts = shape.world_vertices(theta, 0.0, 0.0)
+                if self._extent_ok(pts, theta):
+                    out.append((theta, pts))
+                    if len(out) >= EXACT_MAX_ANGLES:
+                        return out
+        return out
+
+    def _extent_ok(self, pts, theta):
+        for k in range(4):
+            phi = (theta + 45.0 * k) % 180.0
+            ux, uy = math.cos(math.radians(phi)), math.sin(math.radians(phi))
+            proj = [x * ux + y * uy for x, y in pts]
+            if max(proj) - min(proj) > self._room_extent(phi) + 1e-6:
+                return False
+        return True
+
+    def _room_extent(self, phi):
+        key = round(phi, 3)
+        got = self._extents.get(key)
+        if got is None:
+            ux, uy = math.cos(math.radians(phi)), math.sin(math.radians(phi))
+            proj = [x * ux + y * uy for x, y in self.pts]
+            got = max(proj) - min(proj)
+            self._extents[key] = got
+        return got
+
+    def feasible(self, pts, convex):
+        """Every translation of the shape's first vertex that puts the shape
+        (vertices `pts`, first at the origin) inside the room: the room shifted
+        by a point of the shape, minus the translations at which the shape's
+        boundary meets the room's boundary. For a convex shape that obstacle is
+        one convex hull per room edge; in general one parallelogram per pair of
+        edges. Exact for simple polygons."""
+        sp = np.asarray(pts, dtype=float)
+        if convex:
+            # hull of (edge endpoints) minus (every shape vertex)
+            quads = [
+                shapely.MultiPoint(np.concatenate([a - sp, b - sp])).convex_hull
+                for a, b in zip(self._edge_a, self._edge_b)
+            ]
+            obstacle = shapely.union_all(quads)
+        else:
+            s0, s1 = sp[:, None, :], np.roll(sp, -1, axis=0)[:, None, :]
+            a, b = self._edge_a[None, :, :], self._edge_b[None, :, :]
+            quads = np.stack([a - s0, a - s1, b - s1, b - s0], axis=2).reshape(-1, 4, 2)
+            ab, es = b - a, s1 - s0
+            cross = (ab[..., 0] * es[..., 1] - ab[..., 1] * es[..., 0]).reshape(-1)
+            quads = quads[np.abs(cross) > 1e-9]  # parallel edges: a measure-zero set
+            obstacle = (
+                shapely.union_all(shapely.polygons(quads)) if len(quads) else None
+            )
+        c = Polygon(pts).representative_point()
+        inside = Polygon(self._pts_arr - (c.x, c.y))
+        return inside if obstacle is None else inside.difference(obstacle)
+
+    def exact_place(self, shape, theta, pts):
+        """A pose at this rotation if the shape fits anywhere at it, found
+        exactly; a zero-slack fit is allowed the validator's tolerance."""
+        convex = all(t in (1, 2) for t in shape.turns)
+        # charge the real work: one hull per room edge for a convex shape, one
+        # parallelogram per pair of edges otherwise
+        self.checks += (
+            EXACT_COST * len(self.edges) * (1 if convex else max(1, len(pts) // 4))
+        )
+        try:
+            region = self.feasible(pts, convex)
+            if region.is_empty:
+                c = Polygon(pts).representative_point()
+                r = max(math.hypot(x - c.x, y - c.y) for x, y in pts) or 1.0
+                f = 1.0 - 0.9 * TOL / r
+                shrunk = [(c.x + (x - c.x) * f, c.y + (y - c.y) * f) for x, y in pts]
+                region = self.feasible(shrunk, convex)
+                if region.is_empty:
+                    return None
+            t = region.representative_point()
+        except Exception:  # noqa: BLE001 - a geometry error on a pathological room is "no fit here"
+            return None
+        # prefer a pose on the room's integer lattice in this rotation (flush
+        # with walls, which is what later bump growth needs), else the point
+        vx, vy = self.pts[0]
+        dx, dy = _rot(t.x - vx, t.y - vy, -theta)
+        tried = set()
+        for fx in (round, math.floor, math.ceil):
+            for fy in (round, math.floor, math.ceil):
+                sx, sy = fx(dx), fy(dy)
+                if (sx, sy) in tried:
+                    continue
+                tried.add((sx, sy))
+                wx, wy = _rot(sx, sy, theta)
+                cand = (vx + wx, vy + wy)
+                if region.contains(Point(cand)) and self.fits(
+                    shape.world_vertices(theta, *cand)
+                ):
+                    return theta, cand[0], cand[1]
+        if self.fits(shape.world_vertices(theta, t.x, t.y)):
+            return theta, t.x, t.y
+        return None
+
     def place(self, shape, max_checks=4000):
-        """A (theta, tx, ty) that puts the whole shape inside the room, or None."""
-        seen = set()
-        for theta, tx, ty in self.candidates(shape, shape.diagonal > 0):
+        """A (theta, tx, ty) that puts the whole shape inside the room, or None.
+        Anchored poses first (cheap, deduplicated by the polygon they produce),
+        then one exact test per candidate rotation, which finds fits with no
+        slack at all; rooms with very many walls fall back to the coarse sweep."""
+        exact = len(self.edges) * len(shape.vertices) <= EXACT_LIMIT
+        cap = EXACT_FAST_CHECKS if exact else max_checks
+        seen, polys = set(), set()
+        for theta, tx, ty in self._anchored(shape):
+            key = (round(theta % 360.0, 4), round(tx, 4), round(ty, 4))
+            if key in seen:
+                continue
+            seen.add(key)
+            if len(seen) > cap or (len(seen) % 64 == 0 and self.out_of_time()):
+                break
+            world = shape.world_vertices(theta, tx, ty)
+            pkey = tuple(sorted((round(x, 3), round(y, 3)) for x, y in world))
+            if pkey in polys:
+                continue
+            polys.add(pkey)
+            if self.fits(world):
+                return theta, tx, ty
+        if exact:
+            for theta, pts in self.angle_set(shape):
+                if self.out_of_time():
+                    return None
+                pos = self.exact_place(shape, theta, pts)
+                if pos is not None:
+                    return pos
+            return None
+        for theta, tx, ty in self._sweep(shape, shape.diagonal > 0):
             key = (round(theta % 360.0, 4), round(tx, 4), round(ty, 4))
             if key in seen:
                 continue
@@ -654,86 +926,141 @@ class Refiner:
         room = [_rot(x, y, -theta) for x, y in self.placer.pts]
         self.room = room
         room_edges = [(room[i], room[(i + 1) % len(room)]) for i in range(len(room))]
+        # a side's candidate bumps only change when the outline changes near it,
+        # so they are cached by the side's endpoints and dropped around each move
+        self._moves = {}
         for _ in range(max_moves):
             if self.out_of_time():
                 return
-            verts = self._best_move(verts, room_edges, rng, top_k)
-            if verts is None:
+            best = self._best_move(verts, room_edges, rng, top_k)
+            if best is None:
                 return
+            _, i, o, w, h, post = best
+            self._forget(verts, i, o, w, h)
+            verts = self._apply(verts, i, o, w, h, post)
             got = self._to_shape(verts, theta)
             if got is None:
                 return
             yield got
 
+    @staticmethod
+    def _side_key(p, q):
+        return (round(p[0], 6), round(p[1], 6), round(q[0], 6), round(q[1], 6))
+
     def _best_move(self, verts, room_edges, rng, top_k):
+        """The best bump as (gain, side, offset, width, depth, post), or None."""
         n = len(verts)
-        gain_w, gain_p = self.weights.A, self.weights.C
         greedy = rng is None or top_k <= 1
         best = None
         cands = []
         for i in range(n):
             if i % 16 == 0 and self.out_of_time():
                 return None
-            p, q = verts[i], verts[(i + 1) % n]
-            length = math.hypot(q[0] - p[0], q[1] - p[1])
-            li = round(length)
-            ux, uy = (q[0] - p[0]) / length, (q[1] - p[1]) / length
-            nx, ny = uy, -ux  # outward (right of travel) for a CCW loop
-            prev, nxt = verts[i - 1], verts[(i + 2) % n]
-            # a convex corner lets the bump start flush with it (offset 0)
-            p_convex = (p[0] - prev[0]) * nx + (p[1] - prev[1]) * ny > 1e-9
-            q_convex = (nxt[0] - q[0]) * nx + (nxt[1] - q[1]) * ny < -1e-9
-            prev_len = round(math.hypot(p[0] - prev[0], p[1] - prev[1]))
-            next_len = round(math.hypot(nxt[0] - q[0], nxt[1] - q[1]))
-
-            # everything near this side, in its frame (u along, v outwards)
-            room_obs = self._near(room_edges, p, ux, uy, nx, ny, li)
-            own = [(verts[k], verts[(k + 1) % n]) for k in range(n) if k != i]
-            poly_obs = self._near(own, p, ux, uy, nx, ny, li)
-
-            offsets = [0] if p_convex else []
-            offsets += [o for o in self.R if o <= li - 5]
-            for o in offsets:
-                for w in self.R:
-                    post = li - o - w
-                    if post < 0:
-                        break
-                    if post == 0 and not q_convex:
-                        continue
-                    if post != 0 and post not in self.Rset:
-                        continue
-                    if gain_w * w + 2 * gain_p <= 0:
-                        continue
-                    cap = self._clearance(room_obs, poly_obs, o, o + w)
-                    if cap < 5:
-                        continue
-                    # the floor just outside this side must be room
-                    um = o + w / 2
-                    if not _inside(
-                        self.room,
-                        p[0] + ux * um + nx * 1e-3,
-                        p[1] + uy * um + ny * 1e-3,
-                    ):
-                        continue
-                    h = self._depth(cap, o, post, prev_len, next_len)
-                    if h is None:
-                        continue
-                    corners = (2 if o > 0 else 0) + (2 if post > 0 else 0)
-                    if n + corners > self.max_corners:
-                        continue
-                    gain = gain_w * w * h + 2 * gain_p * h
-                    if greedy:
-                        if best is None or gain > best[0]:
-                            best = (gain, i, o, w, h, post)
-                    elif gain > 1e-9:
-                        cands.append((gain, i, o, w, h, post))
+            key = self._side_key(verts[i], verts[(i + 1) % n])
+            moves = self._moves.get(key)
+            if moves is None:
+                moves = self._side_moves(verts, i, room_edges)
+                self._moves[key] = moves
+            for gain, o, w, h, post, corners in moves:
+                if n + corners > self.max_corners:
+                    continue
+                if greedy:
+                    if best is None or gain > best[0]:
+                        best = (gain, i, o, w, h, post)
+                else:
+                    cands.append((gain, i, o, w, h, post))
         if not greedy and cands:
             cands.sort(key=lambda c: -c[0])
             top = cands[:top_k]
             best = rng.choices(top, weights=[c[0] for c in top])[0]
         if best is None or best[0] <= 1e-9:
             return None
-        return self._apply(verts, *best[1:])
+        return best
+
+    def _side_moves(self, verts, i, room_edges):
+        """Every profitable bump over side i: (gain, offset, width, depth,
+        post, corners added)."""
+        n = len(verts)
+        gain_w, gain_p = self.weights.A, self.weights.C
+        p, q = verts[i], verts[(i + 1) % n]
+        length = math.hypot(q[0] - p[0], q[1] - p[1])
+        li = round(length)
+        ux, uy = (q[0] - p[0]) / length, (q[1] - p[1]) / length
+        nx, ny = uy, -ux  # outward (right of travel) for a CCW loop
+        prev, nxt = verts[i - 1], verts[(i + 2) % n]
+        # a convex corner lets the bump start flush with it (offset 0)
+        p_convex = (p[0] - prev[0]) * nx + (p[1] - prev[1]) * ny > 1e-9
+        q_convex = (nxt[0] - q[0]) * nx + (nxt[1] - q[1]) * ny < -1e-9
+        prev_len = round(math.hypot(p[0] - prev[0], p[1] - prev[1]))
+        next_len = round(math.hypot(nxt[0] - q[0], nxt[1] - q[1]))
+
+        # everything near this side, in its frame (u along, v outwards)
+        room_obs = self._near(room_edges, p, ux, uy, nx, ny, li)
+        # the two neighbouring sides end exactly at this side's ends, so they
+        # only matter for a bump flush with them, which is handled by _depth
+        skip = {i, (i - 1) % n, (i + 1) % n}
+        own = [(verts[k], verts[(k + 1) % n]) for k in range(n) if k not in skip]
+        poly_obs = self._near(own, p, ux, uy, nx, ny, li)
+
+        out = []
+        offsets = [0] + [o for o in self.R if o <= li - 5]
+        for o in offsets:
+            for w in self.R:
+                post = li - o - w
+                if post < 0:
+                    break
+                if post != 0 and post not in self.Rset:
+                    continue
+                # new perimeter per unit of depth: a flush end at a reflex corner
+                # fills a notch and adds nothing there
+                units = 2
+                if o == 0 and not p_convex:
+                    units -= 1
+                if post == 0 and not q_convex:
+                    units -= 1
+                if gain_w * w + units * gain_p <= 0:
+                    continue
+                cap = self._clearance(room_obs, poly_obs, o, o + w)
+                if cap < 5:
+                    continue
+                # the floor just outside this side must be room
+                um = o + w / 2
+                if not _inside(
+                    self.room,
+                    p[0] + ux * um + nx * 1e-3,
+                    p[1] + uy * um + ny * 1e-3,
+                ):
+                    continue
+                h = self._depth(cap, o, post, prev_len, next_len, p_convex, q_convex)
+                if h is None:
+                    continue
+                corners = (2 if o > 0 else 0) + (2 if post > 0 else 0)
+                gain = gain_w * w * h + units * gain_p * h
+                if gain > 1e-9:
+                    out.append((gain, o, w, h, post, corners))
+        return out
+
+    def _forget(self, verts, i, o, w, h):
+        """Drop the cached moves of every side the bump over side i could
+        affect: its neighbours, and anything within the bump horizon."""
+        n = len(verts)
+        for k in (i - 1, i, i + 1):
+            self._moves.pop(self._side_key(verts[k % n], verts[(k + 1) % n]), None)
+        p, q = verts[i], verts[(i + 1) % n]
+        length = math.hypot(q[0] - p[0], q[1] - p[1])
+        ux, uy = (q[0] - p[0]) / length, (q[1] - p[1]) / length
+        nx, ny = uy, -ux
+        xs, ys = [], []
+        for du, dv in ((o, 0), (o + w, 0), (o, h), (o + w, h)):
+            xs.append(p[0] + ux * du + nx * dv)
+            ys.append(p[1] + uy * du + ny * dv)
+        pad = 31.5
+        x0, x1, y0, y1 = min(xs) - pad, max(xs) + pad, min(ys) - pad, max(ys) + pad
+        for key in list(self._moves):
+            kx0, kx1 = min(key[0], key[2]), max(key[0], key[2])
+            ky0, ky1 = min(key[1], key[3]), max(key[1], key[3])
+            if kx1 >= x0 and kx0 <= x1 and ky1 >= y0 and ky0 <= y1:
+                del self._moves[key]
 
     @staticmethod
     def _near(edges, p, ux, uy, nx, ny, li):
@@ -788,15 +1115,19 @@ class Refiner:
                 return 0.0
         return cap
 
-    def _depth(self, cap, o, post, prev_len, next_len):
+    def _depth(self, cap, o, post, prev_len, next_len, p_convex, q_convex):
         """Deepest bump we can build. If it is flush with a neighbouring side,
-        that side grows too and must stay a buildable length."""
+        that side grows (convex corner) or shrinks (reflex corner: the bump
+        fills the notch) and must stay a buildable length."""
         for h in reversed(self.R):
             if h > cap + 1e-9:
                 continue
-            if o == 0 and prev_len + h not in self.Rset:
+            if o == 0 and (prev_len + h if p_convex else prev_len - h) not in self.Rset:
                 continue
-            if post == 0 and next_len + h not in self.Rset:
+            if (
+                post == 0
+                and (next_len + h if q_convex else next_len - h) not in self.Rset
+            ):
                 continue
             return h
         return None
@@ -1071,7 +1402,9 @@ class GridEngine:
         self.weights = weights
         self.out_of_time = out_of_time
         self.total_length = sum(n * k for n, k in allocator.pool.counts.items())
-        self.side_lengths = [n for n in range(5, 31) if allocator.side_ok(n)]
+        self.side_lengths = [
+            n for n in range(5, 31) if allocator.side_ok(n, allocator.pool)
+        ]
 
     # grids to try
 
@@ -1089,8 +1422,9 @@ class GridEngine:
         sizes = []
         for s in range(5, 16):
             mults = [k * s for k in range(1, 30 // s + 1)]
-            if all(self.alloc.side_ok(m) for m in mults) and any(
-                self.alloc.gate_options(m) for m in mults
+            pool = self.alloc.pool
+            if all(self.alloc.side_ok(m, pool) for m in mults) and any(
+                self.alloc.gate_options(m, pool) for m in mults
             ):
                 sizes.append(s)
                 if len(sizes) >= limit:
@@ -1104,21 +1438,28 @@ class GridEngine:
             cuts.append(cuts[-1] + s)
         return cuts
 
-    def _slab_cuts(self, pts, gmax):
+    def _slab_cuts(self, pts, gmax, rank=0, free_start=False):
         """Cut positions along y (gaps are buildable side lengths <= gmax),
         picked by dynamic programming to maximise the room area that sits in
         full-height columns of each slab, so slabs line up with the room's bars
-        and arms."""
+        and arms. `rank` picks which vertex fraction the cuts sit on (0 = the
+        most common one); with `free_start` the first cut may sit anywhere
+        within one gap of the room's bottom instead of being pinned to it."""
         gaps = [g for g in self.side_lengths if g <= gmax]
         if not gaps:
             return None
         ys = [p[1] for p in pts]
         lo, hi = min(ys), max(ys)
-        weight = {}
+        weight, exact = {}, {}
         for y in ys:
-            f = round(y - math.floor(y), 6) % 1.0
+            r = y - math.floor(y)
+            f = round(r, 6) % 1.0
             weight[f] = weight.get(f, 0.0) + 1
-        base = math.floor(lo) + max(weight.items(), key=lambda t: t[1])[0]
+            exact.setdefault(f, r % 1.0)
+        fractions = [f for f, _ in sorted(weight.items(), key=lambda t: -t[1])]
+        if rank >= len(fractions):
+            return None
+        base = math.floor(lo) + exact[fractions[rank]]
         if base > lo + 1e-9:
             base -= 1
         span = math.ceil(hi - base - 1e-9)
@@ -1145,7 +1486,12 @@ class GridEngine:
         dp = [-1.0] * (top + 1)
         back = [-1] * (top + 1)
         dp[0] = 0.0
+        if free_start:
+            for t in range(1, min(max(gaps), top + 1)):
+                dp[t] = 0.0
         for t in range(1, top + 1):
+            if t % 64 == 0 and self.out_of_time():
+                return None
             for g in gaps:
                 if t - g >= 0 and dp[t - g] >= 0:
                     val = dp[t - g] + (value(t - g, t) if t - g < span else 0.0)
@@ -1170,11 +1516,20 @@ class GridEngine:
             local = [_rot(x, y, -theta) for x, y in self.placer.pts]
             xs = [p[0] for p in local]
             ys = [p[1] for p in local]
+            swapped = [(y, x) for x, y in local]
+            seen = set()
             for gmax in (10, 14):
-                yc = self._slab_cuts(local, gmax)
-                xc = self._slab_cuts([(y, x) for x, y in local], gmax)
-                if xc and yc:
-                    yield theta, xc, yc
+                for rank, free in ((0, False), (0, True), (1, False), (1, True)):
+                    yc = self._slab_cuts(local, gmax, rank, free)
+                    xc = self._slab_cuts(swapped, gmax, rank, free)
+                    if xc and yc:
+                        key = (
+                            tuple(round(c, 6) for c in xc),
+                            tuple(round(c, 6) for c in yc),
+                        )
+                        if key not in seen:
+                            seen.add(key)
+                            yield theta, xc, yc
             yield from self._window_grids(theta, local)
             for s in sizes:
                 for ox, oy in self._offsets(local, s):
@@ -1209,21 +1564,24 @@ class GridEngine:
             wx += step
         windows.sort(key=lambda t: -t[0])
         for _, clipped in windows[:10]:
-            yc = self._slab_cuts(clipped, 10)
-            xc = self._slab_cuts([(y, x) for x, y in clipped], 10)
-            if xc and yc:
-                yield theta, xc, yc
+            for free in (False, True):
+                yc = self._slab_cuts(clipped, 10, 0, free)
+                xc = self._slab_cuts([(y, x) for x, y in clipped], 10, 0, free)
+                if xc and yc:
+                    yield theta, xc, yc
 
     @staticmethod
     def _offsets(local, s):
         def common(values):
-            count = {}
+            count, exact = {}, {}
             for v in values:
-                r = round(v % s, 6)
+                r = v % s
                 if r > s - 1e-6:
                     r = 0.0
-                count[r] = count.get(r, 0) + 1
-            return [o for o, _ in sorted(count.items(), key=lambda t: -t[1])[:2]]
+                key = round(r, 6)  # rounded only to count; the exact residue is kept
+                count[key] = count.get(key, 0) + 1
+                exact.setdefault(key, r)
+            return [exact[o] for o, _ in sorted(count.items(), key=lambda t: -t[1])[:2]]
 
         xo = common([p[0] for p in local])
         yo = common([p[1] for p in local])
@@ -1237,7 +1595,7 @@ class GridEngine:
             return None
         local = [_rot(x, y, -theta) for x, y in self.placer.pts]
         n = len(local)
-        eps = 1e-7
+        eps = 9e-5  # just under the validator's tolerance: walls 1e-4 off a cut still count as on it
         step = (
             min(
                 min(xc[i + 1] - xc[i] for i in range(nx)),
@@ -1382,6 +1740,8 @@ class GridEngine:
             runs = _runs(edges) if edges else None
             if runs is None:
                 return False
+            if len(runs) > self.right:
+                return False  # already more corners than right connectors
             run = next(
                 (
                     r
@@ -1392,7 +1752,21 @@ class GridEngine:
             )
             if run is None:
                 return True
-            # break after the longest prefix that is still <= 30
+            total = sum(grid.edge_len(e[0], e[2]) for e in run)
+            # cheapest first: dropping a cell at either end of the run shortens
+            # it (and the run around the corner) for two new corners, not four
+            fixed = False
+            for k in (len(run) - 1, 0):
+                cell = run[k][2]
+                if total - grid.edge_len(
+                    run[k][0], cell
+                ) <= 30 + 1e-6 and region.can_remove(cell):
+                    region.cells.discard(cell)
+                    fixed = True
+                    break
+            if fixed:
+                continue
+            # else break after the longest prefix that is still <= 30
             prefix = 0.0
             last_ok = 0
             for k, e in enumerate(run):
@@ -1400,7 +1774,6 @@ class GridEngine:
                 if prefix > 30 + 1e-6:
                     break
                 last_ok = k
-            fixed = False
             for k in range(min(last_ok + 1, len(run) - 2), 0, -1):
                 _, _, inner, outer = run[k]
                 if region.can_add(outer):
@@ -1463,15 +1836,22 @@ class GridEngine:
         theta, tx, ty) -> (score, ok, reason)."""
         w = self.weights
         best = best_score
-        if self.right < 4:
-            return
-        for theta, xc, yc in self.grids():
-            if self.out_of_time():
+        if self.right < 8:
+            return  # with fewer corners a grid outline is a rectangle or an L, which the templates cover
+        for n_grid, (theta, xc, yc) in enumerate(self.grids()):
+            if n_grid >= MAX_GRIDS or self.out_of_time():
                 return
             grid = self.rasterize(theta, xc, yc)
             if grid is None or not grid.inside:
                 continue
-            for seed in self.seeds(grid):
+            starts = self.seeds(grid)
+            if 20 <= len(grid.inside) <= 1500:
+                # a few more seeds spread over the room: nearest-first growth
+                # from the roomiest cell misses blobs that start elsewhere
+                cells = sorted(grid.inside)
+                stride = max(3, len(cells) // 12)
+                starts += [c for c in cells[::stride] if c not in starts]
+            for seed in starts:
                 if self.out_of_time():
                     return
                 order, stats = self.grow(grid, seed, self.right)
@@ -1574,9 +1954,11 @@ def _has_pinch(cells):
 
 
 class Player8(Player):
-    """Score-driven search over many enclosure shapes: templates first, then grid
-    outlines, then growing the best right-angled ones by bumps and finally random
-    restarts. Returns the best valid enclosure, or None."""
+    """Score-driven search over many enclosure shapes: grid outlines first (they
+    are cheap and finish on their own), then the templates, growing every
+    right-angled shape found by bumps, and finally random restarts. Each phase
+    is bounded by work rather than by the clock, so the answer does not depend
+    on the machine. Returns the best valid enclosure, or None."""
 
     def build_enclosure(self):
         self.start = time.process_time()
@@ -1591,31 +1973,39 @@ class Player8(Player):
         if not self.alloc.gates:
             self.note = "No gate of length >= 5 in the inventory, nothing valid exists"
             return None
-        self.placer = Placer(self.room, self._out_of_time)
+        self.placer = Placer(self.room, self._done)
         self.best_score = 0.0
         self.best = None
         self.best_desc = ""
         two_gates = self.weights.G > 0 and sum(self.alloc.gates.values()) >= 2
         self.gate_counts = [2, 1] if two_gates else [1]
-        self.alloc.borrow_for_single = not two_gates
+        self.alloc.borrow_for_single = (
+            True  # 2-gate builds are tried first and compared on real score
+        )
         self.seeds = []  # right-angled enclosures to grow from, best first
+        self._refined = set()  # seeds that have already been grown
+        self._posed = set()  # (shape, pose) pairs already grown
         self._cands = None  # template candidates, worked through in order
+        self._rect_fit_memo = {}  # (a, b) -> whether an a x b rectangle fits the room
         self._next = 0
+        self._restarts = 0
+        self.upper_bound = self._upper_bound()
 
         try:
-            self.deadline = TIME_BUDGET * TEMPLATE_SHARE
-            self._templates()
-            self.deadline = TIME_BUDGET * GRID_SHARE
+            # grid outlines first: cheap, they finish on their own, and they
+            # are the best seeds for bump growth, so nothing may outscore them
+            # before they are evaluated (the grid skips blobs it cannot beat)
             engine = GridEngine(
-                self.placer, self.alloc, self.conn, self.weights, self._out_of_time
+                self.placer, self.alloc, self.conn, self.weights, self._done
             )
             engine.run(self._try_grid_shape, self.best_score)
-            self.deadline = TIME_BUDGET
+            self._room_trace()
             self._refine()
-            # whatever templates the first pass had no time for
-            self.deadline = TIME_BUDGET * RESUME_SHARE
-            self._templates()
-            self.deadline = TIME_BUDGET
+            self._templates(TEMPLATE_CHECKS)
+            self._refine()
+            # whatever templates the first pass did not get to
+            self._templates(TEMPLATE_CHECKS)
+            self._refine()
             self._explore()
         except Exception as e:  # noqa: BLE001 - keep what we have, don't crash the run
             self.note = f"search stopped early ({type(e).__name__}: {e})"
@@ -1625,12 +2015,32 @@ class Player8(Player):
             return None
         self.note = (
             f"{self.best_desc}, expected score {self.best_score:.1f} "
-            f"(cpu {time.process_time() - self.start:.1f}s)"
+            f"(cpu {time.process_time() - self.start:.1f}s, "
+            f"{self.placer.checks} checks, {self._restarts} restarts"
+            f"{', at the upper bound' if self._at_bound() else ''})"
         )
         return self.best
 
     def _out_of_time(self):
         return time.process_time() - self.start > self.deadline
+
+    def _at_bound(self):
+        return self.best_score >= self.upper_bound - 1e-6
+
+    def _done(self):
+        """Stop searching: the safety-net deadline has passed, or nothing can
+        beat what we have."""
+        return self._at_bound() or self._out_of_time()
+
+    def _upper_bound(self):
+        """No enclosure can score more than this: its area is at most the
+        room's and at most what the pieces' total length can enclose
+        (isoperimetric), its perimeter is charged nothing, and the second-gate
+        bonus is assumed whenever two gates exist."""
+        w = self.weights
+        total = sum(n * k for n, k in self.alloc.pool.counts.items())
+        area = min(self.room.polygon.area, total * total / (4 * math.pi))
+        return 1000.0 + w.A * area + (w.G if len(self.gate_counts) > 1 else 0.0)
 
     def _score(self, area, perimeter, bonus):
         w = self.weights
@@ -1643,7 +2053,8 @@ class Player8(Player):
         )
 
     def _side_lengths(self):
-        return [n for n in range(5, 31) if self.alloc.side_ok(n)]
+        pool = self.alloc.pool  # walls plus spare gates used as walls
+        return [n for n in range(5, 31) if self.alloc.side_ok(n, pool)]
 
     def _commit(self, shape, pieces, theta, tx, ty, desc):
         """Build it, check it with the simulator's own rules, keep it if best."""
@@ -1652,10 +2063,9 @@ class Player8(Player):
         if not result.valid:
             return 0.0, False, result.reason
         score = score_construction(result, self.weights)
-        if shape.axis_only:
+        if shape.axis_only and "grown" not in desc:
             self.seeds.append((score, shape, theta, tx, ty))
             self.seeds.sort(key=lambda t: -t[0])
-            del self.seeds[N_SEEDS * 3 :]
         if score > self.best_score:
             self.best_score = score
             self.best = construction
@@ -1670,7 +2080,11 @@ class Player8(Player):
         reason = "pieces"
         for n_gates in self.gate_counts:
             if skip_worse:
-                est = self._score(shape.area, shape.perimeter, n_gates == 2)
+                # a spare gate used as a wall on another face earns the bonus too
+                bonus = n_gates == 2 or (
+                    self.weights.G > 0 and sum(self.alloc.gates.values()) >= 2
+                )
+                est = self._score(shape.area, shape.perimeter, bonus)
                 if est <= self.best_score:
                     # can't beat our best; say "ok" so the caller stops shrinking
                     return est, True, "worse"
@@ -1692,8 +2106,7 @@ class Player8(Player):
         if not lengths:
             return []
         buildable = set(lengths)
-        minx, miny, maxx, maxy = self.room.polygon.bounds
-        room_diag = math.hypot(maxx - minx, maxy - miny) + 1e-6
+        room_diag = self.placer.diameter + 1e-6  # the room's true diameter
         room_area = self.room.polygon.area + 1e-6
         right, diag = self.conn["right"], self.conn["diagonal"]
         bonus = self.weights.G if self.gate_counts[0] == 2 else 0.0
@@ -1717,16 +2130,28 @@ class Player8(Player):
                 for b in lengths:
                     for c in lengths:
                         for d in lengths:
+                            if (b, a, d, c) < (a, b, c, d):
+                                continue  # the same octagon turned by 90 degrees
                             k = (c + d) * r2
                             w, h = a + k, b + k
                             area = w * h - (c * c + d * d) / 2
                             r = min(w, h, (w + h - max(c, d) * 2 * r2) * r2) / 2
+                            # true diameter: the longest of the four antipodal pairs
+                            sd, td = (c - d) * r2, (c + d) * r2
+                            dm = math.sqrt(
+                                max(
+                                    (a + sd) ** 2 + (b + td) ** 2,
+                                    (a - sd) ** 2 + (b + td) ** 2,
+                                    (a + td) ** 2 + (b - sd) ** 2,
+                                    (a + td) ** 2 + (b + sd) ** 2,
+                                )
+                            )
                             add(
                                 "oct",
                                 (a, b, c, d),
                                 area,
                                 2 * (a + b + c + d),
-                                math.hypot(w, h),
+                                dm,
                                 r,
                             )
         if right >= 2 and diag >= 4:
@@ -1737,7 +2162,9 @@ class Player8(Player):
                         w, h = a + k, b + k
                         area = w * h - c * c / 2
                         r = min(w, h, (w + h - c * 2 * r2) * r2) / 2
-                        for family in ("hex", "hex2"):
+                        for family in (
+                            "hex",
+                        ):  # hex2(b, a, c) is hex(a, b, c) turned by 90 degrees
                             add(
                                 family,
                                 (a, b, c),
@@ -1777,30 +2204,160 @@ class Player8(Player):
                                 u_area = w * b1 + (a1 + a3) * b2
                                 u_r = max(min(w, b1), min(max(a1, a3), h)) / 2
                                 t_r = max(min(w, b1), min(a2, h)) / 2
+                                t_dm = max(
+                                    math.hypot(w, b1),
+                                    math.hypot(a1 + a2, h),
+                                    math.hypot(a2 + a3, h),
+                                )
                                 add("U", p, u_area, 2 * (w + h) + 2 * b2, dm, u_r)
-                                add("T", p, w * b1 + a2 * b2, 2 * (w + h), dm, t_r)
-        out.sort(key=lambda t: -t[0])
+                                add("T", p, w * b1 + a2 * b2, 2 * (w + h), t_dm, t_r)
+            # Z and S: two a x b rectangles offset by (c, d); the bounding box
+            # reaches twice the 30-unit face limit
+            for a in lengths:
+                if a < 8:
+                    continue
+                for c in lengths:
+                    if c >= a:
+                        break
+                    for b in lengths:
+                        if b < 8:
+                            continue
+                        for d in lengths:
+                            if d >= b:
+                                break
+                            dm = math.hypot(a + c, b + d)
+                            per = 2 * (a + b + c + d)
+                            add(
+                                "Z",
+                                (a, b, c, d),
+                                (a + c) * (b + d) - 2 * c * d,
+                                per,
+                                dm,
+                                min(a, b) / 2,
+                            )
+                            # the snake: bars d and c thick
+                            add(
+                                "step",
+                                (a, b, c, d),
+                                b * (a + c) - d * (a - c),
+                                per,
+                                dm,
+                                min(c, d) / 2,
+                            )
+        if right >= 3 and diag >= 4:
+            # staircase corners: a diagonal plus a straight hug walls steeper than 45 degrees
+            for p_ in lengths:
+                for q in lengths:
+                    for s_ in lengths:
+                        if q + s_ not in buildable:
+                            continue
+                        if not self._rect_fits(p_, q + s_):
+                            continue  # the stair contains a p x (q + s) rectangle
+                        for c in lengths:
+                            if c > 10:
+                                break
+                            k = c * r2
+                            area = (p_ + k) * (q + s_ + k) - c * s_ * r2 - c * c / 2
+                            per = 2 * (p_ + q + s_ + c)
+                            # true diameter over the seven vertices
+                            pts = [
+                                (0.0, 0.0),
+                                (-p_, 0.0),
+                                (-p_, -q),
+                                (-p_ + k, -q - k),
+                                (-p_ + k, -q - k - s_),
+                                (k, -q - k - s_),
+                                (k, -k),
+                            ]
+                            dm = max(
+                                math.hypot(x1 - x0, y1 - y0)
+                                for i, (x0, y0) in enumerate(pts)
+                                for x1, y1 in pts[i + 1 :]
+                            )
+                            r = min(p_, q) / 2
+                            add("stair", (p_, q, c, s_), area, per, dm, r)
+                            add("stair2", (p_, q, c, s_), area, per, dm, r)
+        # bands: long thin shapes whose faces are kept under 30 by V-dips
+        for k in (1, 2, 3, 4):
+            if right < 4 + 2 * k or diag < 4 * k:
+                continue
+            for s_ in lengths:
+                for d in lengths:
+                    if d > 10:
+                        break
+                    for h in lengths:
+                        if h <= d * math.sqrt(2) + 1e-9:
+                            continue  # the dips from both sides would meet
+                        w = (k + 1) * s_ + k * d * math.sqrt(2)
+                        area = w * h - k * d * d
+                        per = 2 * (k + 1) * s_ + 4 * k * d + 2 * h
+                        add(
+                            "band",
+                            (s_, k, d, h),
+                            area,
+                            per,
+                            math.hypot(w, h),
+                            min(s_, h) / 2,
+                        )
+        # bands with unequal runs (s1, s2) or (s1, s2, s1)
+        for k in (1, 2):
+            if right < 4 + 2 * k or diag < 4 * k:
+                continue
+            for s1 in lengths:
+                for s2 in lengths:
+                    if s1 == s2:
+                        continue
+                    axis = s1 + s2 if k == 1 else 2 * s1 + s2
+                    for d in lengths:
+                        if d > 10:
+                            break
+                        for h in lengths:
+                            if h <= d * math.sqrt(2) + 1e-9:
+                                continue
+                            w = axis + k * d * math.sqrt(2)
+                            area = w * h - k * d * d
+                            per = 2 * axis + 4 * k * d + 2 * h
+                            add(
+                                "band2",
+                                (s1, s2, k, d, h),
+                                area,
+                                per,
+                                math.hypot(w, h),
+                                min(s1, s2, h) / 2,
+                            )
+        out.sort(key=lambda t: (t[1] in LATE_FAMILIES, -t[0]))
         return out
 
-    def _templates(self):
-        """Work through the candidates, best upper bound first. If time runs out
-        we remember where we stopped so a later call can carry on."""
+    def _templates(self, work):
+        """Work through the candidates, best upper bound first, until `work`
+        containment checks have been spent. We remember where we stopped so a
+        later call can carry on. A template that does not fit is tried smaller
+        (committing any size that does), and the smallest size that still does
+        not fit is remembered so that every larger member of the family can be
+        skipped (for the families where larger parameters contain the shape)."""
         if self._cands is None:
             self._cands = self._template_candidates()
             self._next = 0
-            self._failed = {}  # family -> parameter sets that didn't fit anywhere
+            first_late = next(
+                (i for i, c in enumerate(self._cands) if c[1] in LATE_FAMILIES),
+                len(self._cands),
+            )
+            self._seg_ends = sorted({first_late, len(self._cands)})
+            self._failed = {}  # family -> minimal parameter sets that didn't fit
+            self._lengths_sorted = self._side_lengths()
+        spent = self.placer.checks
         while self._next < len(self._cands):
             bound, family, params = self._cands[self._next]
             if bound <= self.best_score:
-                # sorted, so nothing left can win
-                self._next = len(self._cands)
-                return
-            if self._out_of_time():
+                # best first within its segment, so skip to the next segment
+                self._next = next(e for e in self._seg_ends if e > self._next)
+                continue
+            if self._done() or self.placer.checks - spent > work:
                 return
             self._next += 1
             # a rectangle fits the same either way round
             key = tuple(sorted(params)) if family == "rect" else params
-            if any(
+            if family in DOMINANCE_OK and any(
                 all(k >= f for k, f in zip(key, small))
                 for small in self._failed.get(family, ())
             ):
@@ -1808,30 +2365,139 @@ class Player8(Player):
             shape = TEMPLATES[family](*params)
             if not shape.valid() or not self._connectors_ok(shape):
                 continue
+            placed = self._try_template(family, params, shape)
+            if placed is None or placed:
+                continue
+            if self._done():
+                self._next -= 1  # ran out of time, not a real miss
+                return
+            self._shrink(family, params)
 
-            placement = None
-            placed = False
-            for n_gates in self.gate_counts:
-                if self._score(shape.area, shape.perimeter, n_gates == 2) <= (
-                    self.best_score
-                ):
+    def _try_template(self, family, params, shape):
+        """Allocate and place one template: True if committed, False if it
+        does not fit, None if it cannot be built at all."""
+        placement, placed = None, False
+        for n_gates in self.gate_counts:
+            if (
+                self._score(shape.area, shape.perimeter, n_gates == 2)
+                <= self.best_score
+            ):
+                continue
+            pieces = self.alloc.allocate(shape.lengths, n_gates)
+            if pieces is None:
+                continue
+            if not placed:
+                placed = True
+                placement = self.placer.place(shape)
+            if placement is None:
+                return False
+            desc = f"{family} {params}" + (" with 2 gates" if n_gates == 2 else "")
+            self._commit(shape, pieces, *placement, desc)
+        return True if placed else None
+
+    def _shrink(self, family, params):
+        """A template that did not fit: bisect a uniform scale below it, commit
+        any size that fits, and remember the smallest size that did not."""
+        lengths = self._lengths_sorted
+        if not lengths:
+            return
+        lo, hi, failed = 0.0, 1.0, params
+        for _ in range(3):
+            scale = (lo + hi) / 2
+            small = []
+            for i, p in enumerate(params):
+                if (family == "band" and i == 1) or (family == "band2" and i == 2):
+                    small.append(p)  # the number of dips is not a length
                     continue
-                pieces = self.alloc.allocate(shape.lengths, n_gates)
-                if pieces is None:
-                    continue
-                if not placed:
-                    placed = True
-                    placement = self.placer.place(shape)
-                if placement is None:
-                    if self._out_of_time():
-                        self._next -= 1  # ran out of time, not a real miss
-                        return
-                    misses = self._failed.setdefault(family, [])
-                    if len(misses) < MAX_FAILED_MEMO:
-                        misses.append(key)
+                want = max(lengths[0], p * scale)
+                j = bisect.bisect_right(lengths, want + 1e-9) - 1
+                small.append(lengths[max(0, j)])
+            small = tuple(small)
+            if small == params:
+                break
+            shape = TEMPLATES[family](*small)
+            if not shape.valid() or not self._connectors_ok(shape):
+                hi = scale
+                continue
+            placed = self._try_template(family, small, shape)
+            if placed is None or self._done():
+                hi = scale
+                continue
+            if placed:
+                lo = scale
+            else:
+                hi = scale
+                failed = small
+        if family not in DOMINANCE_OK:
+            return
+        key = tuple(sorted(failed)) if family == "rect" else failed
+        memo = self._failed.setdefault(family, [])
+        if any(all(k >= f for k, f in zip(key, small)) for small in memo):
+            return  # a smaller failure already implies this one
+        memo[:] = [m for m in memo if not all(m_ >= k for m_, k in zip(m, key))]
+        if len(memo) < MAX_FAILED_MEMO:
+            memo.append(key)
+
+    def _rect_fits(self, a, b):
+        """Whether an a x b rectangle fits somewhere in the room (memoised): a
+        template that contains such a rectangle cannot fit when it does not."""
+        key = (min(a, b), max(a, b))
+        hit = self._rect_fit_memo.get(key)
+        if hit is None:
+            hit = self.placer.place(TEMPLATES["rect"](*key)) is not None
+            self._rect_fit_memo[key] = hit
+        return hit
+
+    # the room itself
+
+    def _room_trace(self):
+        """The room's own outline, and its insets by 1 to 3 units, as candidates
+        whenever every wall is on the 45-degree grid with a buildable length:
+        in a room of short walls nothing beats following them."""
+        polys = [self.room.polygon]
+        for k in (1, 2, 3):
+            try:
+                inset = self.room.polygon.buffer(-k, join_style=2)
+            except Exception:  # noqa: BLE001 - an inset that cannot be built is simply not a candidate
+                inset = None
+            if (
+                inset is not None
+                and not inset.is_empty
+                and inset.geom_type == "Polygon"
+            ):
+                polys.append(inset)
+        for poly in polys:
+            pts = list(poly.exterior.coords)[:-1]
+            if _area(pts) < 0:
+                pts.reverse()
+            n = len(pts)
+            base = _angle(pts[1][0] - pts[0][0], pts[1][1] - pts[0][1])
+            dirs, lengths, ok = [], [], True
+            for i in range(n):
+                (x0, y0), (x1, y1) = pts[i], pts[(i + 1) % n]
+                length = math.hypot(x1 - x0, y1 - y0)
+                turn = ((_angle(x1 - x0, y1 - y0) - base) % 360.0) / 45.0
+                if abs(turn - round(turn)) > 1e-4 or abs(length - round(length)) > 1e-6:
+                    ok = False
                     break
-                desc = f"{family} {params}" + (" with 2 gates" if n_gates == 2 else "")
-                self._commit(shape, pieces, *placement, desc)
+                d = round(turn) % 8
+                if dirs and dirs[-1] == d:  # a collinear corner: one side
+                    lengths[-1] += round(length)
+                else:
+                    dirs.append(d)
+                    lengths.append(round(length))
+            if not ok or len(dirs) < 4:
+                continue
+            if dirs[0] == dirs[-1]:  # the first and last side are one side
+                lengths[0] += lengths.pop()
+                dirs.pop()
+            if any(not 5 <= length <= 30 for length in lengths):
+                continue
+            shape = Shape("trace", (len(dirs),), dirs, lengths)
+            if shape.valid():
+                self._commit_any(
+                    shape, base, pts[0][0], pts[0][1], f"room trace ({len(dirs)} sides)"
+                )
 
     # grid outlines
 
@@ -1849,18 +2515,43 @@ class Player8(Player):
             self._side_lengths(),
             self.weights,
             self.conn["right"],
-            self._out_of_time,
+            self._done,
         )
-        starts, seen = [], set()
-        for item in self.seeds:
-            key = (item[1].family, tuple(item[1].lengths))
-            if key not in seen:
-                seen.add(key)
-                starts.append(item)
-        for _, shape, theta, tx, ty in starts[:N_SEEDS]:
-            if self._out_of_time():
+        for _, shape, theta, tx, ty in list(self.seeds)[:MAX_REFINE_SEEDS]:
+            key = (shape.family, tuple(shape.lengths))
+            if key in self._refined:
+                continue
+            self._refined.add(key)
+            self._posed.add(self._pose_key(shape, theta, tx, ty))
+            if self._done():
                 return
             self._grow(refiner, shape, theta, tx, ty)
+        # the best rectangles are grown from other places they fit as well: a
+        # seed's first pose says little about how far it can grow
+        rects = [s for s in self.seeds if s[1].family == "rect"][:POSE_SEEDS]
+        for _, shape, _, _, _ in rects:
+            poses, scanned = 0, 0
+            for theta, tx, ty in self.placer._anchored(shape):
+                scanned += 1
+                if self._done() or poses >= POSES_PER_SEED or scanned > 600:
+                    break
+                key = self._pose_key(shape, theta, tx, ty)
+                if key in self._posed:
+                    continue
+                if not self.placer.fits(shape.world_vertices(theta, tx, ty)):
+                    continue
+                self._posed.add(key)
+                poses += 1
+                self._grow(refiner, shape, theta, tx, ty)
+
+    @staticmethod
+    def _pose_key(shape, theta, tx, ty):
+        return (shape.family, tuple(shape.lengths)) + tuple(
+            sorted(
+                (round(x, 3), round(y, 3))
+                for x, y in shape.world_vertices(theta, tx, ty)
+            )
+        )
 
     def _grow(self, refiner, shape, theta, tx, ty, rng=None, top_k=1):
         """Grow the shape by bumps, committing every valid step. False means we
@@ -1869,7 +2560,7 @@ class Player8(Player):
         for grown, th, gx, gy in refiner.refine(
             shape, theta, tx, ty, rng=rng, top_k=top_k
         ):
-            if self._out_of_time():
+            if self._done():
                 return False
             if not self._connectors_ok(grown):
                 break
@@ -1894,28 +2585,42 @@ class Player8(Player):
             theta = rng.choice(angles) + 90.0 * rng.randrange(4)
             x, y = _rot(a / 2, b / 2, theta)
             tx, ty = px - x, py - y
-            if self.placer.fits(shape.world_vertices(theta, tx, ty)):
-                return shape, theta, tx, ty
+            # snap to the room's integer lattice in this rotation: a start that
+            # is flush with a wall grows further than one floating 0.37 off it
+            vx, vy = self.placer.pts[0]
+            dx, dy = _rot(tx - vx, ty - vy, -theta)
+            wx, wy = _rot(round(dx), round(dy), theta)
+            for cand in ((vx + wx, vy + wy), (tx, ty)):
+                if self.placer.fits(shape.world_vertices(theta, *cand)):
+                    return shape, theta, cand[0], cand[1]
         return None
 
     def _explore(self):
-        """Spend the time that is left on random restarts: drop a small square
-        somewhere, then grow it by randomly chosen bumps. One greedy growth gets
-        stuck in a single local optimum; different growth orders find the
-        winding shapes (star arms, letter strokes) it misses."""
-        if self.conn["right"] < 6 or self._out_of_time():
+        """Random restarts: drop a small square somewhere, then grow it by
+        randomly chosen bumps. One greedy growth gets stuck in a single local
+        optimum; different growth orders find the winding shapes (star arms,
+        letter strokes) it misses. Stops after MAX_RESTARTS, or after
+        IDLE_RESTARTS in a row that did not improve the best score."""
+        if self.conn["right"] < 6 or self._done():
             return
         lengths = self._side_lengths()
         if not lengths:
             return
         rng = random.Random(8)
         refiner = Refiner(
-            self.placer, lengths, self.weights, self.conn["right"], self._out_of_time
+            self.placer, lengths, self.weights, self.conn["right"], self._done
         )
         angles = sorted({round(a % 90.0, 4) for a in self.placer.out_angle}) or [0.0]
-        misses = 0
-        while not self._out_of_time():
-            start = self._random_start(rng, lengths[:4], angles)
+        misses = idle = 0
+        while (
+            not self._done() and self._restarts < MAX_RESTARTS and idle < IDLE_RESTARTS
+        ):
+            self._restarts += 1
+            before = self.best_score
+            if self.seeds and rng.random() < 0.34:
+                _, *start = rng.choice(self.seeds[:MAX_REFINE_SEEDS])
+            else:
+                start = self._random_start(rng, lengths[:4], angles)
             if start is None:
                 # no square fits (tight room): grow from something we already have
                 if not self.seeds:
@@ -1926,3 +2631,4 @@ class Player8(Player):
                 _, *start = rng.choice(self.seeds)
             if not self._grow(refiner, *start, rng=rng, top_k=rng.choice((2, 3, 5))):
                 return
+            idle = 0 if self.best_score > before else idle + 1

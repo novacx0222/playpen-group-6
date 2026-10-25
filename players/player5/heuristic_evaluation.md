@@ -1,3 +1,5 @@
+> Archived: this document describes a previous implementation. See [README.md](README.md) for the current strategy and benchmark procedure.
+
 # Turn and final-wall pruning evaluation
 
 These measurements used the scenario snapshot on `naive-exhaustive-search`,
@@ -85,6 +87,10 @@ Both rules are enabled by default and can be disabled independently. Turn feasib
 
 ## Reproduction and validation
 
-These historical timed runs used commit d241ed7. The current README and benchmark use elapsed time, so their commands do not reproduce this old CPU-budget experiment. Raw JSON files are in logs/player5-heuristics-*-5s.json; confirmation runs use *-repeat1.json and *-repeat2.json. Run the standalone benchmark with Python that includes Tkinter.
+These historical timed runs used commit d241ed7 and an older search. The current
+CPU-budget benchmark does not reproduce that implementation. The historical
+records refer to `logs/player5-heuristics-*-5s.json`, with confirmation runs in
+`*-repeat1.json` and `*-repeat2.json`; these logs are not included here. See
+[README.md](README.md) for current commands.
 
 Validation: 23 search tests, including exact turn-feasibility comparison with independent connector-subset enumeration and exhaustive before/after polygon-count checks; 19 simulator geometry tests; Group 5 submission structure/style/smoke checks at a five-second limit.

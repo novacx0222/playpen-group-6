@@ -97,9 +97,9 @@ def diagonal_edits(shape, pose, stock, budget: Budget):
                     )
 
 
-def improve(seeds, room, stock, budget: Budget, evaluate):
+def improve(seeds, room, stock, budget: Budget, evaluate, *, margin=0.01):
     """Resume each parent's edits in short batches; keep a small set of states."""
-    record("diagonal", "start")
+    record("diagonal", "start", margin=margin)
     if not seeds or stock.diagonals < 4:
         record("diagonal", "stop", reason="no_seeds_or_insufficient_connectors")
         return
@@ -143,7 +143,7 @@ def improve(seeds, room, stock, budget: Budget, evaluate):
                 shape, pose = candidate
                 if not room.allowed.covers(shape.placed(pose)):
                     continue
-                floor = max(0, best_score - max(10, best_score * 0.01))
+                floor = max(0, best_score - max(10, best_score * margin))
                 result = evaluate(shape, pose, budget, floor)
                 if result is not None:
                     best_score = max(best_score, result)

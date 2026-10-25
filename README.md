@@ -76,6 +76,22 @@ uv run main.py --seed 123 --export-scenario scenarios/my_scenario.json
 uv run main.py --gui --player e --difficulty scarce
 ```
 
+## Running the tournament
+
+One command runs every player on every tournament scenario (`tournament/scenarios/`) and records each result in a CSV file:
+
+```bash
+uv run python -m tournament.run_tournament
+```
+
+To try only your own player (plus the example for comparison), name it, and add `--all` to also use everyone's scenarios:
+
+```bash
+uv run python -m tournament.run_tournament --players 3 e
+```
+
+Each run is its own process, so a player that crashes or runs out of time only costs its own row. Results go to a new `logs/tournament-<time>/` folder: `results.csv` (one row per run: player, scenario, status, score, area, perimeter, CPU seconds, ...), `summary.csv` (totals per player) and the output of every run. `--jobs N` sets how many run at once (default: your cores minus one); `--resume --out <folder>` carries on an interrupted run; `--dry-run` lists the runs without running them. Run `uv run python -m tournament.run_tournament --help` for the rest.
+
 ## Time limit and logs
 
 **CPU time limit.** A player gets 300 seconds of CPU time per run

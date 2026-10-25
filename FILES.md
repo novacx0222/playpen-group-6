@@ -93,10 +93,24 @@ A scenario is a JSON file: `room` (polygon corners), `inventory`, `weights`.
 | `scenarios/l_shaped_room.json` | A non-convex L-shaped room with a scarcer inventory. |
 | `scenarios/limits_tight_room_favors_small_shape.json` | A tight room where only the smallest of many possible rectangles fits; it caught a real bug in the example player's shape ranking. |
 | `scenarios/invalid_examples.json` | The room and inventory the invalid-enclosure demo is built around (an L-shaped room, plus the odd pieces its examples need). |
-| `scenarios/B.json` | A 29-corner non-convex room (26 x 32) with 1000 of every wall length, one gate, and weights that reward area only. A stress test for placement. |
-| `scenarios/coms4444.json` | A very large non-convex room (176 corners, 236 x 41) with 1000 of every wall length. A stress test for speed. |
-| `scenarios/star.json` | A five-pointed-star room (10 corners) with 1000 of every wall length and no diagonal connectors. |
+| `tournament/scenarios/1a.json` | A regular 50-sided room (every side 2) with a plentiful inventory, all connector types. Weights A=1, C=-1, G=50. |
+| `tournament/scenarios/1b.json` | The same 50-gon with a small but feasible inventory. |
+| `tournament/scenarios/2a.json` | A 42 x 30 room whose whole border is a zigzag of length-2 segments, with a plentiful inventory. |
+| `tournament/scenarios/2b.json` | The same zipper room with a small but feasible inventory. |
+| `tournament/scenarios/3a.json` | A 100 x 100 square with a fixed set of walls, two gates, 10 straight and 12 right connectors, no diagonals. |
+| `tournament/scenarios/3b.json` | The same square with every wall turned into a gate of the same length, so no walls. |
+| `tournament/scenarios/4a.json` | An hourglass: a wide lower lobe and a smaller upper lobe joined by a 4-wide waist, with sharp corners (about 47 degrees). Plentiful inventory. |
+| `tournament/scenarios/4b.json` | The same hourglass with a small but feasible inventory. |
+| `tournament/scenarios/5.json` | A 40 x 25 rectangular room turned 36.87 degrees (corners are whole numbers), with a plentiful inventory. Needs the right start heading. |
+| `tournament/scenarios/6.json` | A tight L-shaped room (23 x 21) with 11 pieces of different lengths and only 6 right-angle connectors. Exactly one enclosure is valid: the L that fills the room. |
 | `scenarios/players/player1/` ... `player10/` | One folder per group for its own test scenarios. Each holds a `.gitkeep` so git keeps the empty folder. |
+
+## `tournament/`
+
+| File | What it is |
+| :-- | :-- |
+| `tournament/run_tournament.py` | Runs players on scenarios and writes one CSV row per run (player, scenario, score, validity, area, CPU time, ...). Every run is its own process, with a CPU limit and a real-time limit. Groups use it to try their own player; you use it for the real tournament. |
+| `tournament/scenarios/` | The tournament's rooms, `1a.json` ... `6.json` (listed in the `scenarios/` table below). |
 
 ## `scripts/`
 
@@ -120,6 +134,7 @@ stand-ins, so a broken group player can't turn the simulator's tests red.
 | `tests/test_submissions.py` | Finding group players, the ownership rules, the submission checker. |
 | `tests/test_gui_layout.py` | The GUI: no overlapping text, nothing clipped at several window sizes, hover tooltips, the score panel. Needs a display. |
 | `tests/test_gui_inventory.py` | The GUI's inventory box (every item listed, used ones highlighted, scrolling), the red negative score, and the panel scrolling on a short screen. Needs a display. |
+| `tests/test_tournament.py` | The tournament runner: which scenarios and players it picks, the CSV rows, crashes and stuck players, resuming, the summary. Runs only the example player. |
 | `tests/test_placement_guide.py` | Runs every code block in `PLACEMENT_GUIDE.md` and checks the numbers it claims; checks the docs only name files that exist, and that this file lists every file. |
 | `tests/__init__.py` | Empty; makes `tests` a package. |
 

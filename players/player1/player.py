@@ -1,16 +1,16 @@
 """Group 1: local search over a closed loop of straight faces.
 
-At each spot in the room, place the highest-scoring rectangle or hexagon the
-stock can build that fits there. Taking the spots best first, grow each
-greedily, then run a softmax local search until it converges or time runs
-out. Return the best loop, with a second gate added if one fits.
+At each spot in the room, place the highest-scoring rectangle, hexagon or
+octagon the stock can build that fits there. Taking the spots best first,
+keep making the change that raises the score most until no change does, or
+CHECK_LIMIT shapes have been scored. Then push the loop flush against a room
+wall and climb again, for as long as that ends higher. Return the best loop.
 """
 
 import functools
 import itertools
 import math
 import os
-import random
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
@@ -32,15 +32,19 @@ from src.inventory import Inventory
 from src.pieces import Connector, ConnectorType, Piece, PieceType
 from src.room import Room
 
-# total CPU time per room, kept under 10 s (a search step can run a little past
-# it); set PLAYER1_CPU_SECONDS in the environment to override
-CPU_SECONDS = float(os.environ.get("PLAYER1_CPU_SECONDS", "9"))
-CONVERGENCE_STEP_NUM = 50  # stop after this many steps without a gain above MIN_GAIN
-MIN_GAIN = 1.0  # score improvement that counts as progress
+# the search stops after scoring this many shapes, so a run does the same work
+# on any computer
+CHECK_LIMIT = 200_000
+# a backup only: CPU time per room, 10 s under the simulator's 300 s limit; set
+# PLAYER1_CPU_SECONDS in the environment to override
+CPU_SECONDS = float(os.environ.get("PLAYER1_CPU_SECONDS", "290"))
 MAX_STARTS = 40  # placements kept, more than the search ever reaches
 FIT_RECTANGLES = 12  # rectangle sizes tried, highest estimated score first
 FIT_HEXAGONS = 8  # hexagon sizes tried, highest estimated score first
+FIT_OCTAGONS = 8  # octagon sizes tried, highest estimated score first
 FIT_SHARE = 0.3  # of the time, at most, spent fitting shapes to spots
+FLUSH_REACH = 6  # how far, at most, a loop is pushed to meet a wall
+LENGTHS = range(c.MIN_WALL_LENGTH, c.MAX_FACE_LENGTH + 1)
 
 CONNECTOR_FOR_TURN = {  # turn in degrees -> connector
     90: Connector(ConnectorType.RIGHT),
@@ -132,18 +136,17 @@ def corners(loop: Loop) -> list[tuple[float, float]]:
     return build_geometry(to_construction(loop))[0]
 
 
-class PreparedRoom(Room):
-    """The room with the simulator's tolerance buffer built once. The
-    simulator's contains_enclosure rebuilds it on every call, which is slow
-    for rooms with many corners; the answer is the same."""
+class Scored(NamedTuple):
+    loop: Loop
+    score: float
 
-    def __init__(self, room: Room):
-        super().__init__(room.polygon)
-        self.floor = room.polygon.buffer(c.TOL)
-        shapely.prepare(self.floor)
 
-    def contains_enclosure(self, enclosure_polygon, tol: float = c.TOL) -> bool:
-        return self.floor.contains(enclosure_polygon)
+ANYWHERE = Room(box(-1e5, -1e5, 1e5, 1e5))
+
+
+def validate_anywhere(loop: Loop, inventory: Inventory):
+    """The simulator's checks of `loop`, all but fitting in the room."""
+    return validate_construction(to_construction(loop), ANYWHERE, inventory)
 
 
 # ------------------------------------------------- choosing pieces for a face
@@ -169,10 +172,10 @@ def spare(inventory: Inventory, faces, *skip: int) -> Inventory:
 def pick_pieces(
     length: int, inventory: Inventory, gate_count: int = 0
 ) -> tuple[Piece, ...] | None:
-    """Pieces in stock adding up to exactly `length`, exactly `gate_count` of
-    them gates, or None. Largest pieces first, so few STRAIGHTs are spent.
-    An empty tuple for length 0. Cached: the same question comes up for many
-    candidates in every step."""
+    """Pieces in stock adding up to exactly `length`, at least `gate_count` of
+    them gates, or None. Largest pieces first, so few STRAIGHTs are spent;
+    walls before any extra gate. An empty tuple for length 0. Cached: the
+    same question comes up for many candidates in every step."""
     walls, gates = tuple(inventory.walls.items()), tuple(inventory.gates.items())
     return _pick_pieces(length, gate_count, walls, gates)
 
@@ -187,13 +190,19 @@ def _pick_pieces(length: int, gate_count: int, walls, gates):
         return () if gate_count == 0 else None
     if not c.MIN_WALL_LENGTH <= length <= c.MAX_FACE_LENGTH:
         return None
-    options = [(n, True) for n, count in gates if count > 0] if gate_count else []
-    options += [(n, False) for n, count in sorted(walls, reverse=True) if count > 0]
+    gate_options = [(n, True) for n, count in gates if count > 0]
+    wall_options = [(n, False) for n, count in sorted(walls, reverse=True) if count > 0]
+    if gate_count:
+        options = gate_options + wall_options
+    else:
+        options = wall_options + gate_options
     for n, is_gate in options:
         if n > length:
             continue
         if is_gate:
-            rest = _pick_pieces(length - n, gate_count - 1, walls, _take_one(gates, n))
+            rest = _pick_pieces(
+                length - n, max(gate_count - 1, 0), walls, _take_one(gates, n)
+            )
         else:
             rest = _pick_pieces(length - n, gate_count, _take_one(walls, n), gates)
         if rest is not None:
@@ -343,26 +352,18 @@ def add_gate_to_face(loop: Loop, inventory: Inventory) -> Iterator[Loop]:
                 yield loop.with_faces(new_faces)
 
 
-def shift_loop(loop: Loop, inventory: Inventory) -> Iterator[Loop]:
-    """Slide the whole loop one unit. Score-neutral; it lets a loop pressed
-    against a room wall grow again on the other side."""
-    x, y = loop.start
-    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-        yield loop.moved_to((x + dx, y + dy))
-
-
 MOVES = (
     resize_face,
     extend_with_a_turn,
-    shift_loop,
     add_diagonal_pair,
     add_gate_to_face,
 )
 
 
-def neighboring_loops(loop: Loop, inventory: Inventory, moves=MOVES) -> Iterator[Loop]:
-    """Valid loops that `moves` make from `loop`."""
-    for move in moves:
+def neighboring_loops(loop: Loop, inventory: Inventory) -> Iterator[Loop]:
+    """Loops the moves make from `loop` that have a connector for every
+    corner. A detour flush with a corner can turn 135 or 180 degrees."""
+    for move in MOVES:
         for candidate in move(loop, inventory):
             candidate = join_aligned_faces(candidate)
             if candidate is None:
@@ -374,125 +375,102 @@ def neighboring_loops(loop: Loop, inventory: Inventory, moves=MOVES) -> Iterator
 # -------------------------------------------------------- initial solutions
 
 
-def smallest_rectangle(inventory: Inventory) -> Loop | None:
-    """The rectangle with the shortest perimeter the inventory can build, with
-    a gate on its first side, at the origin."""
-    if inventory.connectors.get(ConnectorType.RIGHT, 0) < 4:
-        return None
-    lengths = range(c.MIN_WALL_LENGTH, c.MAX_FACE_LENGTH + 1)
-    for a, b in sorted(((a, b) for a in lengths for b in lengths), key=sum):
-        specs = [FaceSpec(0, a, 1), FaceSpec(90, b), FaceSpec(180, a), FaceSpec(270, b)]
-        faces = build_faces(specs, inventory)
-        if faces:
-            return Loop((0.0, 0.0), 0.0, tuple(faces))
-    return None
+def shape_sides(a: int, b: int, d: int, e: int) -> list[tuple[int, int]]:
+    """[(direction, length)] of an a by b rectangle with its corners cut off
+    at 45 degrees: two opposite corners by sides of length d, the other two
+    by sides of length e. With e = 0 a hexagon, which needs 2 right-angle
+    connectors and 4 diagonal ones; with d = e = 0 the rectangle.
 
-
-ANYWHERE = Room(box(-1e5, -1e5, 1e5, 1e5))
-
-
-def buildable(shape: Loop, inventory: Inventory) -> bool:
-    """Whether `shape` passes every check but fitting in the room. None of
-    them change when the shape moves, so this is checked once per shape."""
-    return validate_construction(to_construction(shape), ANYWHERE, inventory).valid
-
-
-def smallest_hexagon(inventory: Inventory) -> Loop | None:
-    """The hexagon with the shortest perimeter the inventory can build, its
-    gate on whichever side takes one, at the origin: a rectangle with two
-    opposite corners cut off at 45 degrees, so it needs only 2 right-angle
-    connectors (and 4 diagonal ones).
-
-               a
-          ┌────────┐
-       d ╱          │
-        ╱           │ b
-       │            │
-     b │           ╱ d
-       │          ╱
-       └─────────┘
-             a
+                a
+            ╱‾‾‾‾‾‾‾╲
+         d ╱         ╲ e
+          │           │
+        b │           │ b
+          │           │
+         e ╲         ╱ d
+            ╲_______╱
+                a
     """
-    lengths = range(c.MIN_WALL_LENGTH, c.MAX_FACE_LENGTH + 1)
-    for a, b, d in sorted(itertools.product(lengths, repeat=3), key=sum):
-        shape = shape_with_gate(hexagon_sides(a, b, d), inventory)
-        if shape:
-            return shape
-    return None
+    return [
+        (0, a),
+        (45, d),
+        (90, b),
+        (135, e),
+        (180, a),
+        (225, d),
+        (270, b),
+        (315, e),
+    ]
 
 
-def hexagon_sides(a: int, b: int, d: int) -> list[tuple[int, int]]:
-    return [(0, a), (45, d), (90, b), (180, a), (225, d), (270, b)]
-
-
-def shape_with_gate(sides, inventory: Inventory) -> Loop | None:
-    """The loop with these [(direction, length)] sides, its gate on whichever
-    side takes one, at the origin, if the stock builds it."""
-    for gate in range(len(sides)):
-        specs = [
-            FaceSpec(direction, length, int(i == gate))
-            for i, (direction, length) in enumerate(sides)
-        ]
-        faces = build_faces(specs, inventory)
-        if faces and len(faces) == len(sides):
-            shape = Loop((0.0, 0.0), 0.0, tuple(faces))
-            if buildable(shape, inventory):
-                return shape
-    return None
-
-
-def best_shapes(inventory: Inventory, weights, deadline: float) -> list:
-    """(estimated score, shape) for the FIT_RECTANGLES rectangles and
-    FIT_HEXAGONS hexagons the stock builds with the highest estimated score,
-    1000 + A * area + C * perimeter."""
-    lengths = range(c.MIN_WALL_LENGTH, c.MAX_FACE_LENGTH + 1)
+def shape_sizes(inventory: Inventory) -> list[tuple[int, int, int, int]]:
+    """(a, b, d, e) for every rectangle, hexagon and octagon (d = e) the
+    connectors allow, each up to rotation once."""
     right = inventory.connectors.get(ConnectorType.RIGHT, 0)
     diagonal = inventory.connectors.get(ConnectorType.DIAGONAL, 0)
-    families = []
-    if right >= 4:
-        rectangles = [
-            (
-                weights.A * a * b + weights.C * 2 * (a + b),
-                [(0, a), (90, b), (180, a), (270, b)],
-            )
-            for a in lengths
-            for b in lengths
-            if a >= b
-        ]
-        families.append((rectangles, FIT_RECTANGLES))
+    cuts = [(0, 0)] if right >= 4 else []
     if right >= 2 and diagonal >= 4:
-        hexagons = []
-        for a, b, d in itertools.product(lengths, repeat=3):
-            cut = d / math.sqrt(2)
-            area = (a + cut) * (b + cut) - cut * cut
-            estimate = weights.A * area + weights.C * 2 * (a + b + d)
-            hexagons.append((estimate, hexagon_sides(a, b, d)))
-        families.append((hexagons, FIT_HEXAGONS))
+        cuts += [(d, 0) for d in LENGTHS]
+    if diagonal >= 8:
+        cuts += [(d, d) for d in LENGTHS]
+    return [
+        (a, b, d, e)
+        for a, b in itertools.product(LENGTHS, LENGTHS)
+        for d, e in cuts
+        if d != e or a >= b
+    ]
+
+
+def corners_cut(size: tuple[int, int, int, int]) -> int:
+    """0 for a rectangle, 1 for a hexagon, 2 for an octagon."""
+    return (size[2] > 0) + (size[3] > 0)
+
+
+def estimated_score(a: int, b: int, d: int, e: int, weights) -> float:
+    cut_d, cut_e = d / math.sqrt(2), e / math.sqrt(2)
+    width, height = a + cut_d + cut_e, b + cut_d + cut_e
+    area = width * height - cut_d * cut_d - cut_e * cut_e
+    return weights.A * area + weights.C * 2 * (a + b + d + e)
+
+
+def built_shapes(
+    sizes, inventory: Inventory, weights, wanted: int, deadline: float
+) -> list[Scored]:
+    """The first `wanted` of `sizes` the stock builds, each with its gate on
+    whichever side takes one, at the origin, scored."""
     found = []
-    for candidates, wanted in families:
-        kept = 0
-        for estimate, sides in sorted(candidates, key=lambda e: -e[0]):
-            if kept == wanted or time.process_time() >= deadline:
+    for size in sizes:
+        if len(found) == wanted or time.process_time() >= deadline:
+            break
+        sides = shape_sides(*size)
+        for gate in range(len(sides)):
+            specs = [
+                FaceSpec(direction, length, int(i == gate))
+                for i, (direction, length) in enumerate(sides)
+            ]
+            faces = build_faces(specs, inventory)
+            if faces is None:
+                continue
+            shape = Loop((0.0, 0.0), 0.0, tuple(faces))
+            result = validate_anywhere(shape, inventory)
+            if result.valid:
+                found.append(Scored(shape, score_construction(result, weights)))
                 break
-            shape = shape_with_gate(sides, inventory)
-            if shape:
-                found.append((1000 + estimate, shape))
-                kept += 1
     return found
 
 
-def starting_shape(inventory: Inventory) -> Loop | None:
-    """The smallest rectangle; with too few right-angle connectors for one,
-    the smallest hexagon."""
-    rectangle = smallest_rectangle(inventory)
-    if rectangle and buildable(rectangle, inventory):
-        return rectangle
-    connectors = inventory.connectors
-    if connectors.get(ConnectorType.RIGHT, 0) < 2:
-        return None
-    if connectors.get(ConnectorType.DIAGONAL, 0) < 4:
-        return None
-    return smallest_hexagon(inventory)
+def starting_shapes(inventory: Inventory, weights, deadline: float) -> list[Scored]:
+    """The smallest shape the stock builds, so that every spot that fits
+    anything gets a shape, then the FIT_RECTANGLES rectangles, FIT_HEXAGONS
+    hexagons and FIT_OCTAGONS octagons it builds with the highest estimated
+    score."""
+    sizes = shape_sizes(inventory)
+    found = built_shapes(sorted(sizes, key=sum), inventory, weights, 1, math.inf)
+    by_estimate = sorted(sizes, key=lambda size: -estimated_score(*size, weights))
+    for cut, wanted in enumerate((FIT_RECTANGLES, FIT_HEXAGONS, FIT_OCTAGONS)):
+        family = [size for size in by_estimate if corners_cut(size) == cut]
+        found += built_shapes(family, inventory, weights, wanted, deadline)
+    return found
 
 
 def room_rotations(room: Room, shape: Loop) -> set[float]:
@@ -506,9 +484,9 @@ def room_rotations(room: Room, shape: Loop) -> set[float]:
     }
 
 
-def placements_at(shape: Loop, rotation: float, room: PreparedRoom) -> list:
-    """(centre, placement) for each placement of `shape` that fits in the
-    room, centred on a grid point or cornered on a room corner. Every
+def placements_at(shape: Loop, rotation: float, room: Room, floor) -> list:
+    """(centre, placement) for each placement of `shape` that fits on the
+    floor, centred on a grid point or cornered on a room corner. Every
     placement is tested at once."""
     min_x, min_y, max_x, max_y = room.polygon.bounds
     step = c.MIN_WALL_LENGTH
@@ -530,146 +508,147 @@ def placements_at(shape: Loop, rotation: float, room: PreparedRoom) -> list:
         ]
     )
     placed = shapely.polygons(starts[:, None, :] + shape_corners[None, :, :])
-    starts = starts[shapely.contains(room.floor, placed)]
+    starts = starts[shapely.contains(floor, placed)]
     return [
         (tuple(np.round(start + middle, 1)), turned.moved_to(tuple(start)))
         for start in starts
     ]
 
 
-def initial_solutions(shapes, room: PreparedRoom, deadline: float) -> list[Loop]:
-    """At each spot, the shape in `shapes` [(estimated score, shape)] with
-    the highest estimated score that fits there; spots best first, centres
-    spaced apart, at most MAX_STARTS of them."""
-    best: dict = {}  # spot -> (estimated score, placement)
-    for estimate, shape in shapes:
+def flush_shifts(loop: Loop, room: Room) -> set[tuple[float, float]]:
+    """Each move of the whole loop, shorter than FLUSH_REACH, that puts one
+    of its faces against a room wall running the same way."""
+    points = corners(loop)
+    shifts = set()
+    for (ax, ay), (bx, by) in zip(points, points[1:] + points[:1]):
+        face_angle = math.atan2(by - ay, bx - ax)
+        for (x1, y1), (x2, y2) in itertools.pairwise(room.polygon.exterior.coords):
+            wall_angle = math.atan2(y2 - y1, x2 - x1)
+            if abs(math.sin(face_angle - wall_angle)) > c.TOL:
+                continue
+            nx, ny = -math.sin(wall_angle), math.cos(wall_angle)
+            distance = (x1 - ax) * nx + (y1 - ay) * ny
+            if c.TOL < abs(distance) < FLUSH_REACH:
+                shifts.add((round(distance * nx, 6), round(distance * ny, 6)))
+    return shifts
+
+
+def initial_solutions(
+    shapes: list[Scored], room: Room, floor, deadline: float
+) -> list[Loop]:
+    """At each spot, the highest-scoring of `shapes` that fits there; spots
+    best first, centres spaced apart, at most MAX_STARTS of them."""
+    best: dict = {}  # spot -> (score, placement)
+    for shape, score in shapes:
         for rotation in sorted(room_rotations(room, shape)):
             if best and time.process_time() >= deadline:
                 break  # out of time: keep what fits so far
-            for middle, loop in placements_at(shape, rotation, room):
-                if middle not in best or best[middle][0] < estimate:
-                    best[middle] = (estimate, loop)
+            for middle, loop in placements_at(shape, rotation, room, floor):
+                if middle not in best or best[middle][0] < score:
+                    best[middle] = (score, loop)
     ranked = sorted(best.items(), key=lambda item: -item[1][0])
     chosen: list[Loop] = []
-    centres: dict[tuple[int, int], list] = {}  # chosen centres, by 5x5 square
+    centres: list[tuple[float, float]] = []
     for middle, (_, loop) in ranked:
         if len(chosen) == MAX_STARTS:
             break
-        i, j = (int(v // c.MIN_WALL_LENGTH) for v in middle)
-        near = (
-            other
-            for di, dj in itertools.product((-1, 0, 1), repeat=2)
-            for other in centres.get((i + di, j + dj), ())
-        )
-        if all(math.dist(middle, other) >= c.MIN_WALL_LENGTH for other in near):
+        if all(math.dist(middle, other) >= c.MIN_WALL_LENGTH for other in centres):
             chosen.append(loop)
-            centres.setdefault((i, j), []).append(middle)
+            centres.append(middle)
     return chosen
 
 
 # ------------------------------------------------------------------- search
 
 
-class Scored(NamedTuple):
-    loop: Loop
-    score: float
-
-
-def softmax_draw(
-    neighbors: list[Scored], score: float, time_left: float, random_state: random.Random
-) -> Scored:
-    """A neighbor drawn with probability ~ exp(gain / temperature)."""
-    gains = [neighbor.score - score for neighbor in neighbors]
-    temperature = time_left * sum(map(abs, gains)) / len(gains)
-    best_gain = max(gains)
-    weights = [math.exp((g - best_gain) / (temperature + 1e-9)) for g in gains]
-    return random_state.choices(neighbors, weights)[0]
-
-
 class Player1(Player):
-    """Group 1: softmax local search from rectangles, closure kept by construction."""
+    """Group 1: best-change local search from the largest rectangles,
+    hexagons and octagons that fit, closure kept by construction."""
 
     def __init__(self, room, inventory, weights) -> None:
-        super().__init__(PreparedRoom(room), inventory, weights)
+        super().__init__(room, inventory, weights)
+        self.floor = room.polygon.buffer(c.TOL)
+        shapely.prepare(self.floor)
+        self.checks = 0  # shapes scored so far
+
+    def out_of_work(self, deadline: float) -> bool:
+        return self.checks >= CHECK_LIMIT or time.process_time() >= deadline
 
     def evaluate(self, loop: Loop) -> float | None:
         """The simulator's score for `loop`, or None if it would be invalid.
         A loop with a corner outside the room is pruned before the (much
         slower) full validation, which would reject it anyway."""
+        self.checks += 1
         xs, ys = zip(*corners(loop))
-        if not shapely.contains_xy(self.room.floor, xs, ys).all():
+        if not shapely.contains_xy(self.floor, xs, ys).all():
             return None
-        result = validate_construction(to_construction(loop), self.room, self.inventory)
-        return score_construction(result, self.weights) if result.valid else None
+        result = validate_anywhere(loop, self.inventory)
+        if not result.valid or not self.floor.contains(result.polygon):
+            return None
+        return score_construction(result, self.weights)
 
-    def scored_neighbors(self, loop: Loop, moves) -> list[Scored]:
-        return [
-            Scored(neighbor, score)
-            for neighbor in neighboring_loops(loop, self.inventory, moves)
-            if (score := self.evaluate(neighbor)) is not None
-        ]
+    def scored_neighbors(self, loop: Loop, deadline: float) -> list[Scored] | None:
+        """The valid neighbors of `loop`, scored; None if time runs out
+        part-way, so that a long step never runs past the deadline."""
+        scored = []
+        for neighbor in neighboring_loops(loop, self.inventory):
+            if time.process_time() >= deadline:
+                return None
+            score = self.evaluate(neighbor)
+            if score is not None:
+                scored.append(Scored(neighbor, score))
+        return scored
 
-    def hill_climb(self, loop: Loop, moves, deadline: float) -> Scored:
-        """Step to the best neighbor until none is better."""
+    def hill_climb(self, loop: Loop, deadline: float) -> Scored:
+        """Step to the best neighbor until none is better, or out of work."""
         current = Scored(loop, self.evaluate(loop))
-        while time.process_time() < deadline:
-            neighbors = self.scored_neighbors(current.loop, moves)
+        while not self.out_of_work(deadline):
+            neighbors = self.scored_neighbors(current.loop, deadline)
+            if neighbors is None:
+                break  # out of time part-way through this step
             better = [n for n in neighbors if n.score > current.score]
             if not better:
                 break
             current = max(better, key=lambda n: n.score)
         return current
 
-    def anneal(
-        self, start: Loop, deadline: float, random_state: random.Random
-    ) -> Scored:
-        """Softmax local search from `start`; the best loop seen."""
-        started = time.process_time()
-        current = best = Scored(start, self.evaluate(start))
-        steps_without_gain = 0
-        while (now := time.process_time()) < deadline:
-            neighbors = self.scored_neighbors(current.loop, MOVES)
-            if not neighbors:
-                break  # nothing around this loop is valid: a dead end
-            time_left = (deadline - now) / (deadline - started)
-            current = softmax_draw(neighbors, current.score, time_left, random_state)
-            steps_without_gain += 1
-            if current.score > best.score:
-                if current.score - best.score > MIN_GAIN:
-                    steps_without_gain = 0
-                best = current
-            if steps_without_gain >= CONVERGENCE_STEP_NUM:
-                break  # converged: early stop
-        return best
+    def push_to_walls(self, result: Scored, deadline: float) -> Scored:
+        """Move the loop flush against a wall and climb again; keep the first
+        move that ends higher, and repeat until none does."""
+        improved = True
+        while improved and not self.out_of_work(deadline):
+            improved = False
+            for dx, dy in flush_shifts(result.loop, self.room):
+                x, y = result.loop.start
+                moved = result.loop.moved_to((x + dx, y + dy))
+                if self.evaluate(moved) is None:
+                    continue
+                climbed = self.hill_climb(moved, deadline)
+                if climbed.score > result.score:
+                    result, improved = climbed, True
+                    break
+        return result
 
     def build_enclosure(self) -> Construction | None:
         now = time.process_time()
         deadline = now + CPU_SECONDS  # covers placing and growing too
         fit_until = now + FIT_SHARE * CPU_SECONDS
-        shapes = best_shapes(self.inventory, self.weights, fit_until)
-        smallest = starting_shape(self.inventory)
-        if smallest:  # so that every spot that fits anything gets a shape
-            result = validate_construction(
-                to_construction(smallest), ANYWHERE, self.inventory
-            )
-            shapes = [(score_construction(result, self.weights), smallest), *shapes]
-        placements = initial_solutions(shapes, self.room, fit_until)
+        shapes = starting_shapes(self.inventory, self.weights, fit_until)
+        placements = initial_solutions(shapes, self.room, self.floor, fit_until)
 
-        random_state = random.Random(0)
         results = []
         for placement in placements:
-            if results and time.process_time() >= deadline:
-                break  # out of time; the first start is always searched
+            if results and self.out_of_work(deadline):
+                break  # out of work; the first start is always searched
             if self.evaluate(placement) is None:
                 continue  # fits only within rounding error
-            grown = self.hill_climb(placement, (resize_face,), deadline)
-            results.append(self.anneal(grown.loop, deadline, random_state))
+            climbed = self.hill_climb(placement, deadline)
+            results.append(self.push_to_walls(climbed, deadline))
         if not results:
             self.note = "no starting shape fits: nothing built"
             return None
         best = max(results, key=lambda result: result.score)
-        best = self.hill_climb(best.loop, (add_gate_to_face,), math.inf)
-        self.note = f"{len(placements)} initial solutions; best {best.score:.0f} ({len(best.loop.faces)} faces)"
+        self.note = f"{len(placements)} initial solutions, {self.checks} shapes scored; best {best.score:.0f} ({len(best.loop.faces)} faces)"
         # A: an enclosure that scores below zero is worse than none at all
         if best.score <= 0:
             self.note += " -- below zero, so nothing is built"
